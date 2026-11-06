@@ -1,0 +1,12 @@
+# insar_sat.jl outputs
+insar_out/
+*.bmp
+*.png
+dem_*.txt
+dem_*.txt.part
+.tmp_elev
+
+# Julia
+*.jl.mem
+*.jl.cov
+Manifest.toml
