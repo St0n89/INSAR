@@ -1,13 +1,16 @@
 #!/usr/bin/env julia
 # ============================================================================
 #
-#   insar_sat.jl -- satellite imagery & InSAR fringe simulator
+#   insar_sat.jl -- satellite imagery & InSAR: simulations + REAL data
 #   ---------------------------------------------------------
 #   Pure Julia standard library (Printf, Random, Downloads). No packages.
 #
 #   * Renders natural-colour "satellite pictures" from synthetic fractal
 #     terrain, or from REAL elevation data (Open-Meteo elevation API,
 #     free, no key: Etna, Fuji, Matterhorn, Reykjanes, Grand Canyon...).
+#   * Fetches REAL Sentinel-2 optical imagery (ESA Copernicus cloudless
+#     mosaic via the open EOX tile service) with a hand-written baseline
+#     JPEG decoder.
 #   * Simulates SAR amplitude images (land-cover backscatter + Rayleigh
 #     speckle with N-look averaging).
 #   * Simulates SAR interferograms (InSAR): deformation sources (Mogi,
@@ -17,11 +20,18 @@
 #     with the classic cyclic InSAR rainbow (1 fringe = lambda/2 of LOS
 #     displacement). Coherence map + unwrapped model field + SAR
 #     amplitude are written alongside.
+#   * Computes REAL interferograms: `real` downloads an actual Sentinel-1
+#     interferogram from the open COMET LiCSAR archive (default: the
+#     March 2021 Fagradalsfjall dike, Iceland), decodes the float GeoTIFF
+#     products with a hand-written RFC-1951 inflater + GeoTIFF reader,
+#     unwraps the phase with its own quality-guided unwrapper and renders
+#     real fringes, coherence and LOS displacement in cm.
 #   * All images are hand-rolled 24-bit BMP (no image package needed).
 #
 #   Usage:
 #     julia insar_sat.jl                  # demo: synthetic volcano island
 #     julia insar_sat.jl etna             # real DEM + summit uplift
+#     julia insar_sat.jl real             # REAL interferogram (Fagradalsfjall)
 #     julia insar_sat.jl terrain --place fuji --noclouds
 #     julia insar_sat.jl insar --source slip --cm 20
 #     julia insar_sat.jl places           # list real-data places
@@ -34,8 +44,10 @@
 #   Phase convention: 1 fringe = lambda/2 (2.77 cm for C-band Sentinel-1).
 #
 #   The deformation models are deliberately simple (Mogi point sources,
-#   a screw-dislocation approximation for strike-slip). This is a fringe
-#   picture generator, not a geophysical inversion engine.
+#   a screw-dislocation approximation for strike-slip). The `real` command
+#   uses genuinely measured radar phase, but raw per-scene products and
+#   from-scratch SAR processing need the free Copernicus Data Space
+#   Ecosystem account + ISCE/SNAP (out of scope for this stdlib tool).
 #
 # ============================================================================
 
@@ -757,6 +769,547 @@ function s2_pixel_of(lat::Float64, lon::Float64, z::Int, tx0::Int, ty0::Int)
 end
 
 # ----------------------------------------------------------------------------
+# 7d. INFLATE (RFC 1951) -- the real-data GeoTIFFs in 7f are Deflate/zlib
+#     compressed and Julia's stdlib ships no zlib, so here is a small,
+#     bit-exact inflater written against RFC 1951. NOTE: DEFLATE reads
+#     bits LSB-first -- this is NOT the JPEG bit reader (MSB-first).
+#     Supported: stored, fixed and dynamic blocks; a 9-bit Huffman lookup
+#     table with a canonical bit-by-bit fallback for longer codes.
+# ----------------------------------------------------------------------------
+
+mutable struct ZBits
+    data::Vector{UInt8}
+    pos::Int                   # next byte to load (1-based)
+    buf::UInt64                # LSB-first bit buffer; bits above nbuf are 0
+    nbuf::Int                  # valid bits in buf
+    n::Int
+end
+
+ZBits(d::Vector{UInt8}) = ZBits(d, 1, UInt64(0), 0, length(d))
+
+function zfill!(zb::ZBits)
+    @inbounds while zb.nbuf <= 48 && zb.pos <= zb.n
+        zb.buf |= UInt64(zb.data[zb.pos]) << zb.nbuf
+        zb.nbuf += 8
+        zb.pos += 1
+    end
+    return zb
+end
+
+function zget!(zb::ZBits, k::Int)
+    if zb.nbuf < k
+        zfill!(zb)
+        zb.nbuf < k && (zb.nbuf = k)   # zero-pad past EOF (corrupt stream)
+    end
+    v = UInt32(zb.buf & ((UInt32(1) << k) - UInt32(1)))
+    zb.buf >>= k
+    zb.nbuf -= k
+    return v
+end
+
+struct ZHuff
+    lut::Vector{UInt32}        # 512 entries: (codelen << 16) | symbol; 0 = escape
+    counts::Vector{Int32}      # codes per length 1..15 (index l+1)
+    syms::Vector{Int32}        # symbols sorted by (length, symbol value)
+    first::Vector{Int32}       # canonical first code per length (index l+1)
+end
+
+function zbuild_huff(lengths::Vector{UInt8})::ZHuff
+    counts = zeros(Int32, 16)
+    for l in lengths
+        l > 0 && (counts[l+1] += Int32(1))
+    end
+    offs = zeros(Int32, 16)                 # offs[l+1]: 0-based start for length l
+    for l in 1:15
+        offs[l+1] = offs[l] + counts[l]
+    end
+    ns = Int(sum(counts))
+    syms = zeros(Int32, max(ns, 1))
+    run = copy(offs)
+    for (s0, l) in enumerate(lengths)
+        if l > 0
+            syms[run[l+1] + 1] = Int32(s0 - 1)
+            run[l+1] += Int32(1)
+        end
+    end
+    # canonical first code per length -- shift EVERY length, incl. zero counts
+    first = zeros(Int32, 16)
+    for l in 1:15
+        first[l+1] = (first[l] + counts[l]) << 1
+    end
+    # 9-bit lookup table: index = the next 9 stream bits, i.e. the canonical
+    # code bit-reversed, with all higher-bit combinations filled in
+    lut = zeros(UInt32, 512)
+    for l in 1:15
+        for k in 0:(counts[l+1] - 1)
+            s = syms[offs[l+1] + k + 1]
+            code = first[l+1] + k
+            if l <= 9
+                r = UInt32(0)
+                for b in 0:l-1
+                    ((code >> b) & 1) == 1 && (r |= UInt32(1) << (l - 1 - b))
+                end
+                step = UInt32(1) << l
+                for j in r:step:UInt32(511)
+                    lut[j+1] = (UInt32(l) << 16) | UInt32(s)
+                end
+            end
+        end
+    end
+    return ZHuff(lut, counts, syms, first)
+end
+
+function zdec!(zb::ZBits, h::ZHuff)::Int
+    if zb.nbuf < 9
+        zfill!(zb)
+    end
+    e = h.lut[(zb.buf & 0x1FF) + 1]
+    l = Int(e >> 16)
+    if l > 0 && l <= zb.nbuf
+        zb.buf >>= l
+        zb.nbuf -= l
+        return Int(e & 0xFFFF)
+    end
+    # escape: code longer than 9 bits -> canonical bit-by-bit decode
+    code = 0; fc = 0; idx = 0
+    for l in 1:15
+        code |= Int(zget!(zb, 1))
+        cnt = Int(h.counts[l+1])
+        if code - cnt < fc
+            return Int(h.syms[idx + (code - fc) + 1])
+        end
+        idx += cnt
+        fc = (fc + cnt) << 1
+        code <<= 1
+    end
+    error("inflate: invalid Huffman code")
+end
+
+function zfixed_huffs()
+    ll = UInt8[]
+    for s in 0:287
+        if s < 144; push!(ll, 0x08)
+        elseif s < 256; push!(ll, 0x09)
+        elseif s < 280; push!(ll, 0x07)
+        else; push!(ll, 0x08); end
+    end
+    return zbuild_huff(ll), zbuild_huff(fill(0x05, 32))
+end
+
+const ZCLORD = UInt8[16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+const ZLEN_BASE = UInt16[3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+                         35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+const ZLEN_EXTRA = UInt8[0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+                         3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+const ZDIST_BASE = UInt16[1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+                          257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
+                          8193, 12289, 16385, 24577]
+const ZDIST_EXTRA = UInt8[0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+                          7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+
+function zread_dynamic!(zb::ZBits)
+    hlit = Int(zget!(zb, 5)) + 257
+    hdist = Int(zget!(zb, 5)) + 1
+    hclen = Int(zget!(zb, 4)) + 4
+    cl = zeros(UInt8, 19)
+    for i in 1:hclen
+        cl[ZCLORD[i] + 1] = UInt8(zget!(zb, 3))
+    end
+    clh = zbuild_huff(cl)
+    total = hlit + hdist
+    lengths = zeros(UInt8, total)
+    i = 1
+    while i <= total
+        s = zdec!(zb, clh)
+        if s < 16
+            lengths[i] = UInt8(s); i += 1
+        elseif s == 16
+            i == 1 && error("inflate: length repeat with no previous")
+            n = 3 + Int(zget!(zb, 2))
+            i - 1 + n > total && error("inflate: length repeat overflow")
+            for _ in 1:n; lengths[i] = lengths[i-1]; i += 1; end
+        else
+            n = s == 17 ? 3 + Int(zget!(zb, 3)) : 11 + Int(zget!(zb, 7))
+            i - 1 + n > total && error("inflate: zero-run overflow")
+            i += n
+        end
+    end
+    return zbuild_huff(lengths[1:hlit]), zbuild_huff(lengths[hlit+1:total])
+end
+
+function zcopy!(out::Vector{UInt8}, d::Int, n::Int)
+    s = length(out) - d              # 0-based source start
+    old = length(out)
+    resize!(out, old + n)
+    if d >= n
+        copyto!(out, old + 1, out, s + 1, n)
+    else
+        for k in 0:n-1
+            @inbounds out[old + k + 1] = out[s + 1 + (k % d)]
+        end
+    end
+    return out
+end
+
+function inflate_zlib(data::Vector{UInt8})::Vector{UInt8}
+    length(data) >= 2 || error("inflate: stream too short")
+    (data[1] & 0x0F) == 8 || error("inflate: not deflate (CM != 8)")
+    ((UInt32(data[1]) << 8) | UInt32(data[2])) % 31 == 0 ||
+        error("inflate: bad zlib header")
+    zb = ZBits(data, 3, UInt64(0), 0, length(data))
+    out = UInt8[]
+    zinflate_loop!(out, zb)
+    return out
+end
+
+function zinflate_loop!(out::Vector{UInt8}, zb::ZBits)
+    while true
+        fin = zget!(zb, 1) == 1
+        btype = Int(zget!(zb, 2))
+        if btype == 0
+            # stored block: byte-align, LEN/NLEN, raw bytes
+            r = zb.nbuf % 8
+            zb.buf >>= r; zb.nbuf -= r
+            len = Int(zget!(zb, 16))
+            nlen = Int(zget!(zb, 16))
+            (len ⊻ nlen) & 0xFFFF == 0xFFFF ||
+                error("inflate: stored-block LEN check failed")
+            for _ in 1:len
+                push!(out, UInt8(zget!(zb, 8)))
+            end
+        elseif btype == 1 || btype == 2
+            lh, dh = btype == 1 ? zfixed_huffs() : zread_dynamic!(zb)
+            while true
+                sym = zdec!(zb, lh)
+                if sym == 256
+                    break
+                elseif sym < 256
+                    push!(out, UInt8(sym))
+                else
+                    sym > 285 && error("inflate: bad length symbol")
+                    li = sym - 256
+                    n = Int(ZLEN_BASE[li]) + Int(zget!(zb, Int(ZLEN_EXTRA[li])))
+                    dsym = zdec!(zb, dh)
+                    dsym > 29 && error("inflate: bad distance symbol")
+                    d = Int(ZDIST_BASE[dsym+1]) +
+                        Int(zget!(zb, Int(ZDIST_EXTRA[dsym+1])))
+                    (d <= 0 || d > length(out)) &&
+                        error("inflate: distance out of range")
+                    zcopy!(out, d, n)
+                end
+            end
+        else
+            error("inflate: reserved block type")
+        end
+        fin && break
+    end
+    return out
+end
+
+# ----------------------------------------------------------------------------
+# 7e. GeoTIFF reader -- exactly the feature set of the LiCSAR products:
+#     little-endian, strip OR tile layout, Deflate compression, uint8 or
+#     float32 samples, TIFF predictors 1 (none), 2 (horizontal diff) and
+#     3 (floating point). Predictor semantics follow libtiff exactly
+#     (tif_predict.c): the predictor restarts on every row of a strip or
+#     tile; for predictor 3 each row's bytes are chained (b[i] += b[i-1],
+#     stride = samples per pixel -- fpAcc), then split into 4 byte planes
+#     and re-interleaved so plane 3 holds each sample's low byte.
+#     Geo tags give the lon/lat of pixel (1,1) and the pixel steps.
+# ----------------------------------------------------------------------------
+
+struct TiffGeo
+    lon0::Float64; dlon::Float64   # lon of column 1 (pixel centre), per column
+    lat0::Float64; dlat::Float64   # lat of row 1; dlat < 0 (north-up image)
+end
+
+struct TiffHead
+    W::Int; H::Int
+    bps::Int; spp::Int
+    compression::Int; predictor::Int
+    tiled::Bool
+    offsets::Vector{Int}; counts::Vector{Int}
+    rowsperstrip::Int
+    tw::Int; tl::Int
+    geo::Union{TiffGeo,Nothing}
+    data::Vector{UInt8}
+end
+
+function tiff_u16(d::Vector{UInt8}, p::Int)
+    return UInt16(d[p]) | (UInt16(d[p+1]) << 8)
+end
+function tiff_u32(d::Vector{UInt8}, p::Int)
+    return UInt32(d[p]) | (UInt32(d[p+1]) << 8) |
+           (UInt32(d[p+2]) << 16) | (UInt32(d[p+3]) << 24)
+end
+function tiff_f64(raw::Vector{UInt8}, i::Int)
+    bits = UInt64(0)
+    for k in 0:7
+        bits |= UInt64(raw[i+k]) << (8k)
+    end
+    return reinterpret(Float64, bits)
+end
+
+const TIFF_TYPESZ = Dict(1 => 1, 2 => 1, 3 => 2, 4 => 4, 5 => 8, 11 => 4, 12 => 8)
+
+function tiff_scalar(tags::Dict{Int,Vector{UInt8}}, tag::Int)
+    raw = tags[tag]
+    return length(raw) >= 4 ? Int(tiff_u32(raw, 1)) : Int(tiff_u16(raw, 1))
+end
+
+function tiff_longs(tags::Dict{Int,Vector{UInt8}}, tag::Int)
+    raw = tags[tag]
+    m = length(raw) ÷ 4
+    out = Vector{Int}(undef, m)
+    for i in 1:m
+        out[i] = Int(tiff_u32(raw, 1 + 4(i-1)))
+    end
+    return out
+end
+
+function tiff_head(path::String)::TiffHead
+    d = read(path)
+    length(d) >= 8 || error("tiff: file too short: ", path)
+    (d[1] == 0x49 && d[2] == 0x49) ||
+        error("tiff: only little-endian (II) files supported")
+    ifd = Int(tiff_u32(d, 5))
+    nent = Int(tiff_u16(d, ifd + 1))
+    tags = Dict{Int,Vector{UInt8}}()
+    for i in 0:nent-1
+        p = ifd + 3 + 12i
+        (p + 12 <= length(d)) || error("tiff: IFD out of range")
+        tag = Int(tiff_u16(d, p))
+        typ = Int(tiff_u16(d, p + 2))
+        cnt = Int(tiff_u32(d, p + 4))
+        haskey(TIFF_TYPESZ, typ) ||
+            error("tiff: unsupported field type ", typ)
+        sz = TIFF_TYPESZ[typ] * cnt
+        if sz <= 4
+            tags[tag] = d[p+8:p+7+sz]
+        else
+            off = Int(tiff_u32(d, p + 8))
+            (off + sz <= length(d)) || error("tiff: field data out of range")
+            tags[tag] = d[off+1:off+sz]
+        end
+    end
+    haskey(tags, 256) || error("tiff: no ImageWidth")
+    haskey(tags, 257) || error("tiff: no ImageLength")
+    W = tiff_scalar(tags, 256); H = tiff_scalar(tags, 257)
+    bps = haskey(tags, 258) ? tiff_scalar(tags, 258) : 1
+    spp = haskey(tags, 277) ? tiff_scalar(tags, 277) : 1
+    compression = haskey(tags, 259) ? tiff_scalar(tags, 259) : 1
+    predictor = haskey(tags, 317) ? tiff_scalar(tags, 317) : 1
+    compression in (1, 8) || error("tiff: unsupported compression ", compression,
+        " (this reader handles none and Adobe Deflate/zlib)")
+    tiled = haskey(tags, 322)
+    local offsets::Vector{Int}, counts::Vector{Int}
+    local tw::Int, tl::Int, rps::Int
+    tw = 0; tl = 0; rps = H
+    if tiled
+        tw = tiff_scalar(tags, 322); tl = tiff_scalar(tags, 323)
+        offsets = tiff_longs(tags, 324); counts = tiff_longs(tags, 325)
+    else
+        offsets = tiff_longs(tags, 273); counts = tiff_longs(tags, 279)
+        rps = haskey(tags, 278) ? tiff_scalar(tags, 278) : H
+    end
+    geo = nothing
+    if haskey(tags, 33550) && haskey(tags, 33922)
+        sx = tiff_f64(tags[33550], 1); sy = tiff_f64(tags[33550], 9)
+        ti = tiff_f64(tags[33922], 1); tj = tiff_f64(tags[33922], 9)
+        gx = tiff_f64(tags[33922], 25); gy = tiff_f64(tags[33922], 33)
+        geo = TiffGeo(gx - ti * sx, sx, gy + tj * sy, -sy)
+    end
+    return TiffHead(W, H, bps, spp, compression, predictor, tiled,
+                    offsets, counts, rps, tw, tl, geo, d)
+end
+
+function tiff_raw(head::TiffHead, k::Int)::Vector{UInt8}
+    off = head.offsets[k]; cnt = head.counts[k]
+    (off + cnt <= length(head.data)) ||
+        error("tiff: strip/tile ", k, " out of range")
+    raw = head.data[off+1:off+cnt]
+    head.compression == 8 && return inflate_zlib(raw)
+    return raw
+end
+
+# apply the TIFF predictor to a decoded strip/tile buffer, per row (libtiff)
+function tiff_predict!(b::Vector{UInt8}, head::TiffHead, rowbytes::Int)
+    pred = head.predictor
+    pred == 1 && return b
+    nrows = length(b) ÷ rowbytes
+    if pred == 2
+        head.bps == 8 || error("tiff: predictor 2 supported for 8-bit only")
+        stride = head.spp
+        for r in 0:nrows-1
+            p = r * rowbytes
+            for j in 1:stride
+                acc = UInt8(0)
+                for i in (p+j):stride:(p+rowbytes)
+                    acc += b[i]
+                    b[i] = acc
+                end
+            end
+        end
+    elseif pred == 3
+        (head.bps == 32 && head.spp == 1) ||
+            error("tiff: predictor 3 supported for 32-bit single-band only")
+        for r in 0:nrows-1
+            p = r * rowbytes
+            @inbounds for i in p+2:p+rowbytes
+                b[i] += b[i-1]
+            end
+        end
+    else
+        error("tiff: unsupported predictor ", pred)
+    end
+    return b
+end
+
+# strip/tile bytes -> sample values (Float64), ncols samples per row
+function tiff_samples(head::TiffHead, raw::Vector{UInt8}, ncols::Int)
+    rowbytes = ncols * head.spp * head.bps ÷ 8
+    length(raw) % rowbytes == 0 ||
+        error("tiff: strip size not a multiple of the row size")
+    nrows = length(raw) ÷ rowbytes
+    tiff_predict!(raw, head, rowbytes)
+    vals = Vector{Float64}(undef, nrows * ncols)
+    if head.bps == 8
+        for r in 0:nrows-1, i in 1:ncols
+            vals[r*ncols + i] = Float64(raw[r*rowbytes + (i-1)*head.spp + 1])
+        end
+    elseif head.bps == 32
+        wc = rowbytes ÷ 4
+        for r in 0:nrows-1
+            p = r * rowbytes
+            @inbounds for i in 1:ncols
+                o = i - 1
+                if head.predictor == 3
+                    # 4 byte planes; sample i low byte comes from plane 3
+                    b0 = raw[p + 3*wc + o + 1]
+                    b1 = raw[p + 2*wc + o + 1]
+                    b2 = raw[p + 1*wc + o + 1]
+                    b3 = raw[p + 0*wc + o + 1]
+                    bits = UInt32(b0) | (UInt32(b1) << 8) |
+                           (UInt32(b2) << 16) | (UInt32(b3) << 24)
+                else
+                    q = p + 4o
+                    bits = UInt32(raw[q+1]) | (UInt32(raw[q+2]) << 8) |
+                           (UInt32(raw[q+3]) << 16) | (UInt32(raw[q+4]) << 24)
+                end
+                vals[r*ncols + i] = Float64(reinterpret(Float32, bits))
+            end
+        end
+    else
+        error("tiff: unsupported bits per sample ", head.bps)
+    end
+    return vals
+end
+
+# read a (crop of a) single-band GeoTIFF as Float64; y0:y1 / x0:x1 are
+# 1-based inclusive ranges of the FULL image; defaults = everything
+function tiff_read(path::String, y0::Int = 1, y1::Int = 0,
+                   x0::Int = 1, x1::Int = 0)::Matrix{Float64}
+    head = tiff_head(path)
+    W, H = head.W, head.H
+    (y1 < y0 || y0 < 1) && (y0 = 1)
+    (x1 < x0 || x0 < 1) && (x0 = 1)
+    y1 <= y0 && (y1 = H)
+    x1 <= x0 && (x1 = W)
+    y1 = min(y1, H); x1 = min(x1, W)
+    out = Matrix{Float64}(undef, y1 - y0 + 1, x1 - x0 + 1)
+    if head.tiled
+        tw, tl = head.tw, head.tl
+        across = cld(W, tw)
+        for ty in fld(y0 - 1, tl):fld(y1 - 1, tl)
+            for tx in fld(x0 - 1, tw):fld(x1 - 1, tw)
+                k = ty * across + tx + 1
+                vals = tiff_samples(head, tiff_raw(head, k), tw)
+                ry0 = max(y0, ty * tl + 1)
+                ry1 = min(y1, (ty + 1) * tl, H)
+                sc0 = max(x0 - tx * tw, 1)
+                sc1 = min(x1 - tx * tw, tw, W - tx * tw)
+                for r in ry0:ry1
+                    tr = r - ty * tl - 1         # 0-based row inside tile
+                    for x in sc0:sc1
+                        out[r-y0+1, tx*tw + x - x0 + 1] = vals[tr*tw + x]
+                    end
+                end
+            end
+        end
+    else
+        rps = head.rowsperstrip
+        for s in fld(y0 - 1, rps) + 1:fld(y1 - 1, rps) + 1
+            vals = tiff_samples(head, tiff_raw(head, s), W)
+            nr = min(rps, H - (s - 1) * rps)      # rows in this strip
+            for r in max(y0, (s-1)*rps + 1):min(y1, (s-1)*rps + nr)
+                tr = r - (s - 1) * rps - 1        # 0-based row inside strip
+                for x in x0:x1
+                    out[r-y0+1, x-x0+1] = vals[tr*W + x]
+                end
+            end
+        end
+    end
+    return out
+end
+
+# ----------------------------------------------------------------------------
+# 7f. REAL interferograms from the COMET LiCSAR open archive (CEDA).
+#     LiCSAR processes real Sentinel-1 SLC scenes into 0.001-deg (~90 m
+#     at these latitudes) geocoded interferogram products: wrapped phase,
+#     coherence and an unwrapped reference, all GeoTIFF -- decoded by
+#     the pure-Julia inflater + GeoTIFF reader above. Free, no key:
+#     https://comet.nerc.ac.uk/COMET-LiCS-portal/
+#     Raw per-scene products & from-scratch SAR processing need the free
+#     Copernicus Data Space Ecosystem account + ISCE/SNAP (out of scope).
+# ----------------------------------------------------------------------------
+
+struct LiCSScene
+    frameset::String
+    trackdir::String
+    lon1::Float64; lon2::Float64; lat1::Float64; lat2::Float64
+    pair::String
+    site::Tuple{Float64,Float64}          # lat, lon of the deformation centre
+    place::String
+    desc::String
+end
+
+const LICSAR_SCENES = [
+    LiCSScene("016A_02504_162118", "16", -25.18, -18.32, 63.19, 66.78,
+        "20210315_20210321", (63.880, -22.272), "reykjanes",
+        "Fagradalsfjall dyke intrusion & Geldingadalur eruption, Reykjanes, Iceland (Mar 2021)"),
+]
+
+function lics_trackdir(frameset::String)
+    t = split(frameset, '_')[1]
+    t = replace(t, r"^0+" => "")
+    return replace(t, r"[A-Z]$" => "")
+end
+
+function lics_url(sc::LiCSScene, pair::String, name::String)
+    return "https://dap.ceda.ac.uk/neodc/comet/data/licsar_products/" *
+           sc.trackdir * "/" * sc.frameset * "/" * pair * "/" *
+           pair * ".geo." * name
+end
+
+function lics_download(url::String, dest::String; attempts::Int = 4)
+    isfile(dest) && return dest
+    part = dest * ".part"
+    for a in 1:attempts
+        try
+            Downloads.download(url, part)
+            mv(part, dest; force = true)
+            return dest
+        catch e
+            rm(part; force = true)
+            a == attempts && error("download failed: ", url, " (",
+                sprint(showerror, e)[1:min(end, 120)], ")")
+            println("  download hiccup, retrying (", a, ")...")
+            sleep(2.0 * a)
+        end
+    end
+end
+
+# ----------------------------------------------------------------------------
 # 8. Natural-colour satellite rendering
 # ----------------------------------------------------------------------------
 
@@ -1129,6 +1682,170 @@ function render_insar_over(img::Array{UInt8,3}, px::Float64, seed::Int,
 end
 
 # ----------------------------------------------------------------------------
+# 11c. REAL interferogram processing: a quality-guided phase unwrapper and
+#      rendering of a real LiCSAR interferogram (wrapped fringes masked by
+#      the real coherence, the coherence map itself, and LOS displacement
+#      from OUR OWN unwrapping, in cm; positive = toward the satellite).
+#      No synthetic physics here -- everything comes from the products.
+# ----------------------------------------------------------------------------
+
+wrapd(x::Float64) = x - 2π * round(x / (2π))
+
+const DISP_STOPS = [
+    (0.00, (0.15, 0.25, 0.80)),
+    (0.25, (0.45, 0.65, 0.98)),
+    (0.50, (1.00, 1.00, 1.00)),
+    (0.75, (0.99, 0.72, 0.35)),
+    (1.00, (0.80, 0.15, 0.10)),
+]
+disp_cmap(t::Float64) = sample_stops(DISP_STOPS, clamp01(t)) .* 255.0
+
+mutable struct QGHeap
+    q::Vector{Float64}
+    idx::Vector{Int}
+end
+QGHeap() = QGHeap(Float64[], Int[])
+
+function qg_push!(h::QGHeap, q::Float64, i::Int)
+    push!(h.q, q); push!(h.idx, i)
+    k = length(h.q)
+    @inbounds while k > 1
+        p = k >> 1
+        h.q[p] >= h.q[k] && break
+        h.q[p], h.q[k] = h.q[k], h.q[p]
+        h.idx[p], h.idx[k] = h.idx[k], h.idx[p]
+        k = p
+    end
+    return h
+end
+
+function qg_pop!(h::QGHeap)
+    q0 = h.q[1]; i0 = h.idx[1]
+    n = length(h.q)
+    h.q[1] = h.q[n]; h.idx[1] = h.idx[n]
+    pop!(h.q); pop!(h.idx)
+    n -= 1
+    k = 1
+    @inbounds while true
+        l = 2k; r = l + 1; m = k
+        if l <= n && h.q[l] > h.q[m]; m = l; end
+        if r <= n && h.q[r] > h.q[m]; m = r; end
+        m == k && break
+        h.q[k], h.q[m] = h.q[m], h.q[k]
+        h.idx[k], h.idx[m] = h.idx[m], h.idx[k]
+        k = m
+    end
+    return q0, i0
+end
+
+# quality-guided unwrapping: flood fill ordered by coherence (max-heap);
+# each pixel is integrated against its first already-unwrapped neighbour
+# via wrapped phase differences. Returns NaN outside the region reached.
+function unwrap_quality(pha::Matrix{Float64}, coh::Matrix{Float64},
+                        mask::AbstractMatrix{Bool})::Matrix{Float64}
+    H, W = size(pha)
+    unw = fill(NaN, H, W)
+    done = falses(H, W)
+    queued = falses(H, W)
+    best = -1.0; blin = 0
+    for j in 1:H, i in 1:W
+        if mask[j,i] && coh[j,i] > best
+            best = coh[j,i]; blin = (j - 1) * W + i
+        end
+    end
+    blin == 0 && return unw
+    bj = (blin - 1) ÷ W + 1; bi = (blin - 1) % W + 1
+    unw[bj,bi] = 0.0
+    done[bj,bi] = true
+    heap = QGHeap()
+    for (dj, di) in ((-1, 0), (1, 0), (0, -1), (0, 1))
+        jj = bj + dj; ii = bi + di
+        if 1 <= jj <= H && 1 <= ii <= W && mask[jj,ii] &&
+           !done[jj,ii] && !queued[jj,ii]
+            queued[jj,ii] = true
+            qg_push!(heap, coh[jj,ii], (jj - 1) * W + ii)
+        end
+    end
+    while !isempty(heap.q)
+        _, lin = qg_pop!(heap)
+        j = (lin - 1) ÷ W + 1; i = (lin - 1) % W + 1
+        queued[j,i] = false
+        done[j,i] && continue
+        ref = NaN
+        for (dj, di) in ((-1, 0), (1, 0), (0, -1), (0, 1))
+            jj = j + dj; ii = i + di
+            if 1 <= jj <= H && 1 <= ii <= W && done[jj,ii]
+                ref = unw[jj,ii] + wrapd(pha[j,i] - pha[jj,ii])
+                break
+            end
+        end
+        isnan(ref) && continue
+        unw[j,i] = ref
+        done[j,i] = true
+        for (dj, di) in ((-1, 0), (1, 0), (0, -1), (0, 1))
+            jj = j + dj; ii = i + di
+            if 1 <= jj <= H && 1 <= ii <= W && mask[jj,ii] &&
+               !done[jj,ii] && !queued[jj,ii]
+                queued[jj,ii] = true
+                qg_push!(heap, coh[jj,ii], (jj - 1) * W + ii)
+            end
+        end
+    end
+    return unw
+end
+
+# render the three real-InSAR products
+function render_real_insar(pha::Matrix{Float64}, coh::Matrix{Float64},
+                          unw::Matrix{Float64}, lam_cm::Float64,
+                          cohthr::Float64)
+    H, W = size(pha)
+    mask = (coh .>= cohthr) .& (.!isnan.(pha))
+    dcm = similar(pha)                        # LOS displacement [cm]
+    @inbounds for k in eachindex(dcm)
+        u = unw[k]
+        dcm[k] = isnan(u) ? NaN : -u * lam_cm / (4π)
+    end
+    m = 0.0
+    @inbounds for k in eachindex(dcm)
+        isnan(dcm[k]) || (m = max(m, abs(dcm[k])))
+    end
+    m > 0 || (m = 1.0)
+    img  = Array{UInt8}(undef, H, W, 3)
+    imgc = Array{UInt8}(undef, H, W, 3)
+    imgd = Array{UInt8}(undef, H, W, 3)
+    Threads.@threads for j in 1:H
+        @inbounds for i in 1:W
+            g = coh[j,i]
+            c = coh_cmap(g)
+            imgc[j,i,1] = to8(c[1]); imgc[j,i,2] = to8(c[2]); imgc[j,i,3] = to8(c[3])
+            if mask[j,i]
+                t = mod(pha[j,i] / (2π), 1.0)
+                rgb = insar_cmap(t)
+                f = 0.72 + 0.28 * g
+                img[j,i,1] = to8(rgb[1] * f)
+                img[j,i,2] = to8(rgb[2] * f)
+                img[j,i,3] = to8(rgb[3] * f)
+            else
+                v = to8(20.0 + 40.0 * g)
+                img[j,i,1] = v; img[j,i,2] = v; img[j,i,3] = v
+            end
+            if isnan(unw[j,i])
+                imgd[j,i,1] = 24; imgd[j,i,2] = 24; imgd[j,i,3] = 24
+            else
+                c2 = disp_cmap((dcm[j,i] / m + 1.0) / 2.0)
+                imgd[j,i,1] = to8(c2[1]); imgd[j,i,2] = to8(c2[2])
+                imgd[j,i,3] = to8(c2[3])
+            end
+        end
+    end
+    stats = (max_cm = m,
+             mean_coh = count(mask) > 0 ? sum(coh[mask]) / count(mask) : 0.0,
+             nunw = count(x -> !isnan(x), unw),
+             ncoh = count(mask))
+    return img, imgc, imgd, dcm, stats
+end
+
+# ----------------------------------------------------------------------------
 # 12. CLI
 # ----------------------------------------------------------------------------
 
@@ -1150,6 +1867,13 @@ function usage()
                       key): --place NAME or --lat/--lon; add --insar to
                       draw a simulated interferogram on top of the real
                       image
+      real            REAL interferogram: downloads a genuine Sentinel-1
+                      interferogram from the open COMET LiCSAR archive
+                      (no key; default: the 2021 Fagradalsfjall dike,
+                      Iceland), decodes the GeoTIFF products with the
+                      built-in inflater/TIFF reader, unwraps the phase
+                      with its own quality-guided unwrapper and renders
+                      fringes, coherence and LOS displacement in cm
       places          list real-elevation places
       help            this text
       <place>         shortcut, e.g. `etna` = real DEM + satellite + InSAR
@@ -1165,13 +1889,21 @@ function usage()
                       and the same command resumes on rerun (default: off)
       --fast          aggressive API pacing (only if you are not hitting the
                       rate limit; the tool self-throttles otherwise)
-      --lat N --lon N   location for s2, decimal degrees
+      --lat N --lon N   location for s2/real, decimal degrees
       --zoom Z        web-mercator zoom for s2 (default 11; ~76 m/px at
                       lat 37 for the 10 m Sentinel-2 mosaic)
       --tiles N|AxB  s2 tile grid, 256 px each (default 4 = 4x4)
       --year Y       s2cloudless mosaic year (2017-2023, default 2023)
       --insar        s2: also render a simulated interferogram on top
-      --label NAME   s2: output filename label (default: place or lon_lat)
+      --label NAME   s2/real: output filename label (default: place)
+      --frameset F   real: LiCSAR frameset ID (expert; also needs --pair)
+      --pair P       real: epoch pair YYYYMMDD_YYYYMMDD (default: the
+                      scene's showcase pair)
+      --crop D       real: crop half-width in degrees of latitude around
+                      the target (default 0.2); --full for the whole frame
+      --full         real: process the entire frame
+      --unwref       real: also fetch the LiCSAR unwrapped reference and
+                      verify our unwrapping against it (up to a constant)
       --source S      mogi | dyke | sill | slip | none (default mogi)
       --depth M       source depth in m (default 3500 synthetic / per place)
       --cm X          max LOS displacement in cm (default 14)
@@ -1185,7 +1917,8 @@ function usage()
       --bperp M       perpendicular baseline in m -> topographic fringes (0=off)
       --demerr F      DEM error fraction for bperp fringes (default 0)
       --atm F         atmospheric turbulence strength 0..1 (default 0.35)
-      --coh F         baseline coherence 0..1 (default 0.9)
+      --coh F         simulator: baseline coherence 0..1 (default 0.9);
+                      real: mask/unwrap threshold (default 0.15)
       --relief M      synthetic terrain relief in m (default 1900)
       --waterfrac F   synthetic sea fraction (default 0.30)
       --snowline M    override snowline elevation (per place default)
@@ -1252,7 +1985,7 @@ function main()
         println("  ", join(sort(collect(keys(PLACES))), ", "))
         return
     end
-    if cmd ∉ ("demo", "terrain", "sar", "insar", "place", "s2")
+    if cmd ∉ ("demo", "terrain", "sar", "insar", "place", "s2", "real")
         println("unknown command '", cmd, "' -- try `help`")
         return
     end
@@ -1333,6 +2066,120 @@ function main()
                       img_i)
             @printf("  deformation: %.2f cm max LOS -> %.1f fringes, mean coherence %.3f\n",
                     stats.max_los_cm, stats.fringes, stats.mean_coh)
+        end
+        println("done.")
+        return
+    end
+
+    # -------------------------------------------------- real InSAR (LiCSAR) --
+    if cmd == "real"
+        scene = nothing
+        if place != ""
+            for sc in LICSAR_SCENES
+                sc.place == place && (scene = sc)
+            end
+            scene === nothing && error("no real-InSAR scene for place '", place,
+                "' -- available: ", join([sc.place for sc in LICSAR_SCENES], ", "))
+        elseif haskey(opts, "frameset")
+            fs = get(opts, "frameset", "")
+            isempty(fs) && error("--frameset needs a LiCSAR frameset ID")
+            isempty(get(opts, "pair", "")) &&
+                error("--frameset also needs --pair YYYYMMDD_YYYYMMDD")
+            scene = LiCSScene(fs, lics_trackdir(fs), -180.0, 180.0, -90.0, 90.0,
+                              get(opts, "pair", ""), (NaN, NaN), "",
+                              "custom frameset " * fs)
+        else
+            scene = LICSAR_SCENES[1]
+        end
+        pair = get(opts, "pair", scene.pair)
+        latC, lonC = scene.site
+        haskey(opts, "lat") && (latC = num(opts, "lat", latC))
+        haskey(opts, "lon") && (lonC = num(opts, "lon", lonC))
+        label = get(opts, "label", "")
+        isempty(label) && (label = isempty(scene.place) ? scene.frameset : scene.place)
+        cache = joinpath(outdir, "licsar_" * scene.frameset)
+        mkpath(cache)
+        println("  scene: ", scene.desc)
+        println("  frameset ", scene.frameset, ", pair ", pair,
+                " (COMET LiCSAR archive via CEDA, cached in ", cache, ")")
+        phaf = joinpath(cache, pair * ".geo.diff_pha.tif")
+        ccf  = joinpath(cache, pair * ".geo.cc.tif")
+        lics_download(lics_url(scene, pair, "diff_pha.tif"), phaf)
+        lics_download(lics_url(scene, pair, "cc.tif"), ccf)
+        pha_head = tiff_head(phaf)
+        cc_head = tiff_head(ccf)
+        (pha_head.W == cc_head.W && pha_head.H == cc_head.H) ||
+            error("phase / coherence grid mismatch")
+        pha_head.geo === nothing && error("interferogram has no geo tags")
+        geo = pha_head.geo
+        W, H = pha_head.W, pha_head.H
+        if haskey(opts, "full")
+            y0, y1, x0, x1 = 1, H, 1, W
+        else
+            half = num(opts, "crop", 0.2)
+            half > 0 || error("--crop must be > 0")
+            isnan(latC) && error("--lat/--lon needed to centre the crop")
+            halflon = half / max(cosd(latC), 0.05)
+            y0 = max(1, Int(floor(1 + (geo.lat0 - (latC + half)) / (-geo.dlat))))
+            y1 = min(H, Int(ceil(1 + (geo.lat0 - (latC - half)) / (-geo.dlat))))
+            x0 = max(1, Int(floor(1 + (lonC - halflon - geo.lon0) / geo.dlon)))
+            x1 = min(W, Int(ceil(1 + (lonC + halflon - geo.lon0) / geo.dlon)))
+            (y1 >= y0 && x1 >= x0) || error("crop window outside the frame")
+        end
+        @printf("  frame %dx%d px, crop rows %d:%d cols %d:%d (%.2f-%.2f E, %.2f-%.2f N)\n",
+                W, H, y0, y1, x0, x1,
+                geo.lon0 + geo.dlon * (x0 - 1), geo.lon0 + geo.dlon * (x1 - 1),
+                geo.lat0 + geo.dlat * (y1 - 1), geo.lat0 + geo.dlat * (y0 - 1))
+        println("  decoding wrapped phase + coherence (pure-Julia inflate + GeoTIFF)...")
+        pha = tiff_read(phaf, y0, y1, x0, x1)
+        ccv = tiff_read(ccf, y0, y1, x0, x1)
+        coh = ccv ./ 255.0
+        pha .= wrapd.(pha)                    # defensive re-wrap into (-pi, pi]
+        any(isnan, pha) && println("  warning: NaN pixels in the phase (masked out)")
+        cohthr = num(opts, "coh", 0.15)
+        lam_cm = num(opts, "lambda", 5.55)
+        mask = (coh .>= cohthr) .& (.!isnan.(pha))
+        count(mask) == 0 && error("no coherent pixels -- lower the --coh threshold")
+        println("  unwrapping (quality-guided flood fill, coherence-ordered)...")
+        unw = unwrap_quality(pha, coh, mask)
+        frac = count(!isnan, unw) / count(mask)
+        @printf("  unwrapped %d / %d coherent px (%.1f %%)\n",
+                count(!isnan, unw), count(mask), 100frac)
+        frac < 0.02 && println("  warning: almost nothing unwrapped -- coherence threshold too high?")
+        img, imgc, imgd, dcm, stats = render_real_insar(pha, coh, unw, lam_cm, cohthr)
+        write_bmp(joinpath(outdir, "interferogram_real_" * label * ".bmp"), img)
+        write_bmp(joinpath(outdir, "coherence_real_" * label * ".bmp"), imgc)
+        write_bmp(joinpath(outdir, "unwrapped_real_" * label * ".bmp"), imgd)
+        Hc, Wc = size(pha)
+        cy = (Hc + 1) ÷ 2; cx = (Wc + 1) ÷ 2
+        dc = dcm[cy, cx]
+        @printf("  deformation: %.2f cm max |LOS| = %.1f fringes (relative to the most coherent reference px), mean coherence %.3f\n",
+                stats.max_cm, stats.max_cm / (lam_cm / 2), stats.mean_coh)
+        if isnan(dc)
+            println("  centre pixel not unwrapped (masked as incoherent)")
+        else
+            @printf("  LOS displacement at the crop centre: %+.2f cm (positive = toward satellite)\n",
+                    dc)
+        end
+        if haskey(opts, "unwref")
+            unwf = joinpath(cache, pair * ".geo.unw.tif")
+            lics_download(lics_url(scene, pair, "unw.tif"), unwf)
+            ref = tiff_read(unwf, y0, y1, x0, x1)
+            diffs = Float64[]
+            for k in eachindex(unw)
+                if !isnan(unw[k]) && !isnan(ref[k])
+                    push!(diffs, wrapd(unw[k] - ref[k]))
+                end
+            end
+            if length(diffs) > 100
+                s = sum(cos, diffs); t = sum(sin, diffs)
+                R = hypot(s, t) / length(diffs)
+                @printf("  check vs LiCSAR unwrapped: %d px agree up to a constant %.4f rad (concentration %.4f)\n",
+                        length(diffs), atan(t, s), R)
+                R > 0.999 && println("  -> our unwrapping reproduces the reference field")
+            else
+                println("  check vs LiCSAR unwrapped: too little overlap")
+            end
         end
         println("done.")
         return
@@ -1446,4 +2293,7 @@ function main()
     println("done.")
 end
 
-main()
+# run only as a script (allows `include` for testing without side effects)
+if abspath(PROGRAM_FILE) == @__FILE__
+    main()
+end

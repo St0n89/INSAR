@@ -1,7 +1,7 @@
-# insar_sat.jl — satellite imagery & InSAR fringe simulator
+# insar_sat.jl — satellite imagery & InSAR: simulations + real interferograms
 
-Pure **Julia standard library** (Printf, Random, Downloads). No packages, no
-build step, no API key. One file. Runs on Julia ≥ 1.9.
+Pure **Julia standard library** (Printf, Random, Downloads, LinearAlgebra).
+No packages, no build step, no API key. One file. Runs on Julia ≥ 1.9.
 
 ## What it does
 
@@ -26,6 +26,21 @@ build step, no API key. One file. Runs on Julia ≥ 1.9.
   (1 fringe = λ/2 LOS motion = 2.77 cm for C-band)
 - SAR amplitude images (land-cover backscatter + Rayleigh speckle, 4 looks)
 
+**Real interferograms** — the `real` command computes fringes from
+genuinely *measured* radar phase:
+- downloads a real Sentinel-1 interferogram from the open **COMET LiCSAR**
+  archive (CEDA, free, no key); default scene: the **March 2021
+  Fagradalsfjall dike intrusion**, Iceland — the interferogram that caught
+  the Geldingadalur eruption in the act
+- the products are float32 GeoTIFFs (Deflate + TIFF predictors) — decoded
+  by a **hand-written RFC-1951 inflater and GeoTIFF reader in pure Julia**
+  (validated byte-for-byte against reference decoders)
+- the tool runs its **own quality-guided phase unwrapper**
+  (coherence-ordered flood fill) and converts phase to LOS displacement in
+  cm; with `--unwref` it also fetches the LiCSAR unwrapped reference and
+  verifies the agreement (the Fagradalsfjall pair reproduces the reference
+  field with concentration 1.0000)
+
 Outputs are hand-written 24-bit **BMP** files (same writer style as
 `newton_fractal.jl`): `satellite_*`, `sar_*`, `interferogram_*`,
 `coherence_*`, `unwrapped_*`.
@@ -36,6 +51,7 @@ Outputs are hand-written 24-bit **BMP** files (same writer style as
 julia insar_sat.jl                  # demo: synthetic island, full suite
 julia insar_sat.jl etna             # real DEM + summit uplift fringes
 julia insar_sat.jl fuji             # ...same for Fuji etc.
+julia insar_sat.jl real             # REAL interferogram (Fagradalsfjall 2021)
 julia insar_sat.jl s2 --place etna --insar  # REAL Sentinel-2 + fringes
 julia insar_sat.jl places           # list all real-data places
 julia insar_sat.jl help             # all options
@@ -87,10 +103,54 @@ julia insar_sat.jl s2 --lat 37.50 --lon 15.09 --zoom 12 --year 2021
   topographic term and no stratified atmosphere, but turbulent + ramp
   atmosphere, coherence decay, and phase noise are modelled as usual
 
-**Honesty note:** this is real Sentinel-2 *pixels*, not per-scene products.
-Raw Sentinel-2 scenes, Sentinel-1 SLC data and real interferometry need the
-free **Copernicus Data Space Ecosystem** account plus SNAP/ISCE processing
-(multi-GB downloads) — out of scope for a stdlib tool.
+**Honesty note (s2):** this is real Sentinel-2 *pixels*, not per-scene
+products. Raw Sentinel-2 scenes need the free **Copernicus Data Space
+Ecosystem** account — out of scope for a stdlib tool.
+
+## REAL interferograms (`real` command)
+
+```bash
+# the showcase: Fagradalsfjall dike, Iceland, 15-21 March 2021
+julia insar_sat.jl real                          # ~44x50 km around the vent
+julia insar_sat.jl real --crop 0.1               # zoom on the fringes
+julia insar_sat.jl real --unwref                 # + verify vs LiCSAR unwrapped
+julia insar_sat.jl real --full                   # the whole 250 km frame
+# any LiCSAR frameset/pair (expert; see the COMET LiCSAR portal)
+julia insar_sat.jl real --frameset 016A_02504_162118 \
+       --pair 20210315_20210321
+```
+
+Outputs: `interferogram_real_*` (wrapped fringes, masked by real coherence),
+`coherence_real_*`, `unwrapped_real_*` (LOS displacement in cm from our own
+unwrapping, diverging blue→white→red).
+
+- data: **COMET LiCSAR** products (LiCSBAS processing of real Sentinel-1
+  SLCs by the University of Leeds) on the CEDA archive — free, no key:
+  `https://comet.nerc.ac.uk/COMET-LiCS-portal/`
+- the float32 GeoTIFFs use Deflate compression and the tricky TIFF
+  *floating-point predictor*; both are decoded by pure-Julia code written
+  from the RFC/libtiff sources and **validated byte-for-byte** against
+  independent Python (zlib + hand-rolled) decoders on the real files
+- unwrapping: **quality-guided** region growing (coherence-ordered flood
+  fill, seed at the most coherent pixel); coherence below `--coh T`
+  (default 0.15) is masked out; displacement d = −λφ/(4π), positive toward
+  the satellite; values are relative to the reference pixel
+- `--unwref` cross-checks our unwrapped field against the LiCSAR
+  unwrapped product: agreement up to a single constant is expected (both
+  are re-referenced); the Fagradalsfjall pair matches with circular
+  concentration 1.0000 over 200k+ pixels
+- products are cached in `out/licsar_<frameset>/`; only the crop rows are
+  inflated (strips), so even `--full` stays single-pass
+- grid: 0.001° pixels (~111 m EW, ~56-70 m NS here), geocoded WGS-84;
+  geo tags provide the lon/lat mapping
+
+**Honesty note (real):** the interferogram itself is produced by the
+COMET LiCSAR pipeline from real SLCs — this tool decodes, unmasks,
+**unwraps** (its own algorithm) and renders it. Computing the
+interferogram from scratch (SLC focusing, coregistration, topographic
+phase removal) needs the free **Copernicus Data Space Ecosystem**
+account (`https://dataspace.copernicus.eu/`) plus ISCE/SNAP — out of
+scope for a stdlib tool.
 
 ## Real-data notes (Open-Meteo elevation API)
 
@@ -118,8 +178,10 @@ free **Copernicus Data Space Ecosystem** account plus SNAP/ISCE processing
 - coherence: γ_eff = γ0 · exp(−|∇φ|/2.2), water = 0.04; phase noise
   σ = √((1−γ²)/(2Lγ²)) with L = 4 looks (standard CRLB for interferometric
   phase)
-- the "unwrapped" product is the model displacement field, i.e. what a
-  phase-unwrapping step should recover — not an actual unwrapping algorithm
+- the simulator's "unwrapped" product is the model displacement field,
+  i.e. what a phase-unwrapping step should recover — but the `real`
+  command performs an *actual* quality-guided phase unwrapping of
+  measured phase, validated against the reference product
 
 ## Options
 
@@ -148,6 +210,16 @@ free **Copernicus Data Space Ecosystem** account plus SNAP/ISCE processing
 --waterfrac F   synthetic sea fraction (default 0.30)
 --snowline M    override snowline elevation
 --noclouds      disable cirrus overlay
+--frameset F    real: LiCSAR frameset ID (expert; needs --pair)
+--pair P         real: epoch pair YYYYMMDD_YYYYMMDD (default: showcase pair)
+--crop D         real: crop half-width [deg latitude] (default 0.2)
+--full           real: process the entire frame
+--coh T          real: coherence mask/unwrap threshold (default 0.15)
+--unwref         real: verify our unwrapping vs the LiCSAR reference
+--zoom Z         s2: web-mercator zoom (default 11)
+--tiles N|AxB    s2: tile grid (default 4)
+--year Y         s2: mosaic year (2017-2023, default 2023)
+--label NAME     s2/real: filename label (default: place)
 ```
 
 BMP → PNG conversion (the tool intentionally stays stdlib-only):
