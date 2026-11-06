@@ -42,6 +42,7 @@
 using Printf
 using Random
 using Downloads
+using LinearAlgebra   # mul!/transpose for the 8x8 IDCTs
 
 # ----------------------------------------------------------------------------
 # 1. Small helpers
@@ -427,6 +428,335 @@ function upsample(dem::Matrix{Float64}, H2::Int, W2::Int)
 end
 
 # ----------------------------------------------------------------------------
+# 7c. REAL Sentinel-2 imagery: ESA Copernicus data served as the open
+#     "Sentinel-2 cloudless" WMTS mosaic by EOX (no API key, free access).
+#     Tiles are baseline JPEG (SOF0, 4:2:0, no restarts), so they are decoded
+#     by a small baseline JPEG decoder written in pure Julia below -- no
+#     external imaging package. Raw scene products & real SAR interferometry
+#     need the free Copernicus Data Space Ecosystem + SNAP/ISCE (out of
+#     scope for this stdlib tool).
+# ----------------------------------------------------------------------------
+
+# zigzag: natural (row-major, 1-based) index of the j-th coefficient in scan
+const JZIG = UInt8[
+     1, 2, 9,17,10, 3, 4,11,18,25,33,26,19,12, 5, 6,
+    13,20,27,34,41,49,42,35,28,21,14, 7, 8,15,22,29,
+    36,43,50,57,58,51,44,37,30,23,16,24,31,38,45,52,
+    59,60,53,46,39,32,40,47,54,61,62,55,48,56,63,64]
+
+# 8x8 IDCT matrix  IDCTM[x,u] = C(u)/2 * cos((2x+1)u*pi/16),  C(0)=1/sqrt(2)
+const IDCTM = [(u == 0 ? 0.35355339059327373 : 0.5) *
+               cos((2x + 1) * u * π / 16) for x in 0:7, u in 0:7]
+
+mutable struct JBitReader
+    data::Vector{UInt8}
+    pos::Int          # index of the byte currently being read
+    nbit::Int         # next bit within that byte (1 = MSB); 9 = byte exhausted
+    skip00::Bool      # current byte is an FF followed by stuffed 00
+end
+
+@inline function jbit!(br::JBitReader)::Int
+    if br.nbit > 8
+        br.pos += 1
+        if br.skip00
+            br.pos += 1                # skip the stuffed 00 after FF
+            br.skip00 = false
+        end
+        if br.pos > length(br.data)
+            return 0                  # zero-pad truncated streams
+        end
+        if br.data[br.pos] == 0xFF
+            if br.pos < length(br.data) && br.data[br.pos+1] == 0x00
+                br.skip00 = true      # FF is data, the 00 is stuffing
+            else
+                error("unexpected JPEG marker inside entropy data")
+            end
+        end
+        br.nbit = 1
+    end
+    v = (br.data[br.pos] >> (8 - br.nbit)) & 0x01
+    br.nbit += 1
+    return v
+end
+
+jrecv!(br::JBitReader, n::Int) = (v = 0; for _ in 1:n; v = (v << 1) | jbit!(br); end; v)
+
+jextend(v::Int, n::Int) = v < (1 << (n - 1)) ? v - (1 << n) + 1 : v
+
+struct JHuff
+    minc::NTuple{16,Int}
+    maxc::NTuple{16,Int}
+    valp::NTuple{16,Int}
+    vals::Vector{UInt8}
+end
+
+function jbuild_huff(counts, vals)::JHuff
+    minc = fill(-1, 16); maxc = fill(-1, 16); valp = fill(0, 16)
+    code = 0; k = 1
+    for len in 1:16
+        c = Int(counts[len])
+        if c > 0
+            minc[len] = code; valp[len] = k; maxc[len] = code + c - 1
+            k += c
+        end
+        code = (code + c) << 1    # shift EVERY length, also for c == 0
+    end
+    return JHuff((minc...,), (maxc...,), (valp...,), vals)
+end
+
+function jhuff!(ht::JHuff, br::JBitReader)::Int
+    code = 0
+    for len in 1:16
+        code = (code << 1) | jbit!(br)
+        mc = ht.maxc[len]
+        if mc >= 0 && code <= mc
+            return Int(ht.vals[ht.valp[len] + code - ht.minc[len]])
+        end
+    end
+    return error("corrupt JPEG: invalid Huffman code")
+end
+
+# decode one 8x8 block into blk (natural order, dequantized, no IDCT)
+function jdecode_block!(blk::Matrix{Float64}, br::JBitReader,
+                        htd::JHuff, hta::JHuff, qt::Matrix{Float64},
+                        c::Int, dcp::Vector{Int})
+    fill!(blk, 0.0)
+    t = jhuff!(htd, br)
+    dcp[c] += (t == 0 ? 0 : jextend(jrecv!(br, t), t))
+    blk[1,1] = dcp[c] * qt[1,1]
+    k = 2
+    while k <= 64
+        rs = jhuff!(hta, br)
+        s = rs & 0x0F
+        if s == 0
+            if rs == 0xF0            # ZRL: skip 16 zeros
+                k += 16
+            else                     # EOB
+                return
+            end
+        else
+            k += rs >> 4             # skip r zeros
+            if k <= 64
+                nat = Int(JZIG[k])
+                u = (nat - 1) ÷ 8 + 1
+                v = (nat - 1) % 8 + 1
+                blk[u,v] = jextend(jrecv!(br, s), s) * qt[u,v]
+            end
+            k += 1
+        end
+    end
+    return
+end
+
+"""Baseline JPEG (SOF0/SOF1, interleaved scan) -> HxWx3 UInt8 RGB array."""
+function decode_jpeg(data::Vector{UInt8})::Array{UInt8,3}
+    length(data) >= 4 || error("not a JPEG")
+    (data[1] == 0xFF && data[2] == 0xD8) || error("not a JPEG (no SOI)")
+    qt = Dict{Int,Matrix{Float64}}()
+    htd = Dict{Int,JHuff}(); hta = Dict{Int,JHuff}()
+    cid = Int[]; hs = Int[]; vs = Int[]; tqs = Int[]
+    tds = Int[]; tas = Int[]
+    W = 0; H = 0; dri = 0; sos_end = 0
+    pos = 3
+    while pos < length(data) - 1
+        if data[pos] != 0xFF
+            pos += 1
+            continue
+        end
+        m = Int(data[pos + 1])
+        if m == 0xFF
+            pos += 1
+            continue
+        end
+        if m == 0xD8 || (0xD0 <= m <= 0xD7)   # stray SOI/RST before SOS
+            pos += 2
+            continue
+        end
+        m == 0xD9 && error("EOI before SOS")
+        seglen = (Int(data[pos+2]) << 8) | Int(data[pos+3])
+        seglen >= 2 || error("bad JPEG segment length")
+        if m == 0xC0 || m == 0xC1             # SOF: baseline/extended
+            H = (Int(data[pos+5]) << 8) | Int(data[pos+6])
+            W = (Int(data[pos+7]) << 8) | Int(data[pos+8])
+            ncomp = Int(data[pos+9])
+            ncomp in (1, 3) || error("unsupported JPEG component count ", ncomp)
+            empty!(cid); empty!(hs); empty!(vs); empty!(tqs)
+            for k in 0:ncomp-1
+                push!(cid, Int(data[pos+10+3k]))
+                push!(hs, Int(data[pos+11+3k]) >> 4)
+                push!(vs, Int(data[pos+11+3k]) & 0x0F)
+                push!(tqs, Int(data[pos+12+3k]))
+            end
+        elseif m in (0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB,
+                     0xCD, 0xCE, 0xCF)
+            error("unsupported JPEG process (progressive/arithmetic)")
+        elseif m == 0xC4                      # DHT
+            p = pos + 4
+            pend = pos + 2 + seglen
+            while p < pend
+                tclass = Int(data[p]) >> 4
+                th = Int(data[p]) & 0x0F
+                p += 1
+                counts = data[p:p+15]
+                p += 16
+                n = Int(sum(counts))
+                n > 0 || continue
+                vals = data[p:p+n-1]
+                p += n
+                h = jbuild_huff(counts, vals)
+                if tclass == 0; htd[th] = h; else; hta[th] = h; end
+            end
+        elseif m == 0xDB                      # DQT
+            p = pos + 4
+            pend = pos + 2 + seglen
+            while p < pend
+                Int(data[p]) >> 4 == 0 || error("16-bit quant table unsupported")
+                tq = Int(data[p]) & 0x0F
+                p += 1
+                t = Matrix{Float64}(undef, 8, 8)
+                for j in 1:64
+                    nat = Int(JZIG[j])
+                    t[(nat-1)÷8+1, (nat-1)%8+1] = Float64(data[p+j-1])
+                end
+                p += 64
+                qt[tq] = t
+            end
+        elseif m == 0xDD                      # DRI
+            dri = (Int(data[pos+4]) << 8) | Int(data[pos+5])
+        elseif m == 0xDA                      # SOS
+            ns = Int(data[pos+4])
+            ns == length(cid) ||
+                error("only single interleaved JPEG scans supported")
+            resize!(tds, ns); resize!(tas, ns)
+            for k in 0:ns-1
+                cs = Int(data[pos+5+2k])
+                idx = findfirst(==(cs), cid)
+                idx === nothing && error("scan comp not in SOF")
+                tds[idx] = Int(data[pos+6+2k]) >> 4
+                tas[idx] = Int(data[pos+6+2k]) & 0x0F
+            end
+            sos_end = pos + 1 + seglen        # last SOS-header byte
+            break
+        end
+        pos += 2 + seglen
+    end
+    (W > 0 && H > 0 && !isempty(cid)) || error("no SOF found in JPEG")
+
+    ncomp = length(cid)
+    hmax = maximum(hs); vmax = maximum(vs)
+    mcux = cld(W, 8hmax); mcuy = cld(H, 8vmax)
+    planes = [Matrix{Float64}(undef, mcuy * vs[c] * 8, mcux * hs[c] * 8)
+              for c in 1:ncomp]
+    dcp = zeros(Int, ncomp)
+    br = JBitReader(data, sos_end, 9, false)
+    blk = Matrix{Float64}(undef, 8, 8)
+    tmp = Matrix{Float64}(undef, 8, 8)
+    dct = Matrix{Float64}(undef, 8, 8)
+    IDCTT = transpose(IDCTM)
+    mcun = 0
+    for my in 1:mcuy, mx in 1:mcux
+        for c in 1:ncomp
+            qtc = qt[tqs[c]]
+            hd = htd[tds[c]]
+            ha = hta[tas[c]]
+            for j in 1:vs[c], i in 1:hs[c]
+                jdecode_block!(blk, br, hd, ha, qtc, c, dcp)
+                mul!(tmp, IDCTM, blk)     # rows: x (height)
+                mul!(dct, tmp, IDCTT)     # cols: y (width)
+                y0 = (my - 1) * vs[c] * 8 + (j - 1) * 8
+                x0 = (mx - 1) * hs[c] * 8 + (i - 1) * 8
+                for yy in 1:8, xx in 1:8
+                    planes[c][y0+yy, x0+xx] = dct[yy,xx] + 128.0
+                end
+            end
+        end
+        mcun += 1
+        if dri > 0 && mcun % dri == 0 && (my != mcuy || mx != mcux)
+            br.nbit = 9                  # align to byte boundary
+            if br.skip00
+                br.pos += 1
+                br.skip00 = false
+            end
+            if br.pos + 2 <= length(data) && data[br.pos+1] == 0xFF &&
+               0xD0 <= Int(data[br.pos+2]) <= 0xD7
+                br.pos += 2               # consume RSTn
+            end
+            fill!(dcp, 0)
+        end
+    end
+
+    img = Array{UInt8}(undef, H, W, 3)
+    pY = planes[1]
+    ch = size(pY, 1); cw = size(pY, 2)
+    pCb = ncomp >= 3 ? planes[2] : pY
+    pCr = ncomp >= 3 ? planes[3] : pY
+    chb = size(pCb, 1); cwb = size(pCb, 2)
+    for j in 1:H
+        sy  = min(ch,  1 + (j - 1) * ch  ÷ H)
+        syb = min(chb, 1 + (j - 1) * chb ÷ H)
+        for i in 1:W
+            sx  = min(cw,  1 + (i - 1) * cw  ÷ W)
+            sxb = min(cwb, 1 + (i - 1) * cwb ÷ W)
+            Y  = pY[sy, sx]
+            if ncomp == 1
+                v = to8(Y)
+                img[j,i,1] = v; img[j,i,2] = v; img[j,i,3] = v
+            else
+                Cb = pCb[syb, sxb]; Cr = pCr[syb, sxb]
+                img[j,i,1] = to8(Y + 1.402 * (Cr - 128.0))
+                img[j,i,2] = to8(Y - 0.344136 * (Cb - 128.0) - 0.714136 * (Cr - 128.0))
+                img[j,i,3] = to8(Y + 1.772 * (Cb - 128.0))
+            end
+        end
+    end
+    return img
+end
+
+# fetch + stitch an Nx x Ny grid of s2cloudless WMTS tiles centred on lat/lon
+function s2_fetch_tiles(lat::Float64, lon::Float64, z::Int, nx::Int, ny::Int,
+                        year::Int, outdir::String)
+    n = 2^z
+    tx = floor(Int, (lon + 180) / 360 * n)
+    ty = floor(Int, (1 - asinh(tan(deg2rad(lat))) / π) / 2 * n)
+    tx0 = clamp(tx - (nx - 1) ÷ 2, 0, n - nx)
+    ty0 = clamp(ty - (ny - 1) ÷ 2, 0, n - ny)
+    img = fill(UInt8(28), 256 * ny, 256 * nx, 3)
+    misses = 0
+    for jy in 0:ny-1, ix in 0:nx-1
+        x = tx0 + ix; y = ty0 + jy
+        url = "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-" * string(year) *
+              "_3857/default/GoogleMapsCompatible/" * string(z) * "/" *
+              string(y) * "/" * string(x) * ".jpg"
+        try
+            tmp = joinpath(outdir, ".tmp_tile.jpg")
+            Downloads.download(url, tmp)
+            d = read(tmp)
+            rm(tmp; force = true)
+            tile = decode_jpeg(d)
+            Ht, Wt = size(tile, 1), size(tile, 2)
+            img[jy*256+1:jy*256+Ht, ix*256+1:ix*256+Wt, :] .= tile
+        catch err
+            misses += 1
+            println("  tile ", x, ",", y, " unavailable (",
+                    first(sprint(showerror, err), 60), ")")
+        end
+        @printf("  tiles %d/%d\r", jy * nx + ix + 1, nx * ny)
+        flush(stdout)
+        (jy * nx + ix < nx * ny - 1) && sleep(0.12)
+    end
+    println("  tiles ", nx * ny, "/", nx * ny, " loaded (", misses, " missing)")
+    return img, tx0, ty0
+end
+
+# global web-mercator pixel of lat/lon -> pixel inside the stitched tile grid
+function s2_pixel_of(lat::Float64, lon::Float64, z::Int, tx0::Int, ty0::Int)
+    n = 2^z
+    wx = (lon + 180) / 360 * n * 256
+    wy = (1 - asinh(tan(deg2rad(lat))) / π) / 2 * n * 256
+    return 1 + wx - tx0 * 256, 1 + wy - ty0 * 256
+end
+
+# ----------------------------------------------------------------------------
 # 8. Natural-colour satellite rendering
 # ----------------------------------------------------------------------------
 
@@ -740,6 +1070,65 @@ function render_insar(dem::Matrix{Float64}, px::Float64, seed::Int,
 end
 
 # ----------------------------------------------------------------------------
+# 11b. Interferogram over a REAL image (s2 --insar): same physics, no DEM ->
+#      no stratified atmosphere / no topographic term; fringes are shaded by
+#      the real image luminance so the terrain stays recognizable.
+# ----------------------------------------------------------------------------
+
+function render_insar_over(img::Array{UInt8,3}, px::Float64, seed::Int,
+                           cfg::NamedTuple)
+    H, W = size(img, 1), size(img, 2)
+    l = los_vector(cfg.heading, cfg.inc)
+    lam = cfg.lam_cm / 100.0
+    dlos = Matrix{Float64}(undef, H, W)
+    source_field!(dlos, W, H, px, cfg.source, cfg.xc, cfg.yc, cfg.srcpars, l)
+    m = maximum(abs, dlos)
+    m > 0 && (dlos .*= (cfg.cm / 100.0) / m)
+    φ = (4π / lam) .* dlos
+    if cfg.atm > 0.0
+        ga = NG(UInt64(seed) + 0xB00)
+        ramp_a = cfg.atm * 0.9
+        Threads.@threads for j in 1:H
+            for i in 1:W
+                turb = 2.6 * (fbm(ga, 0.006i, 0.006j; oct = 6) - 0.5) * 2.0
+                ramp = ramp_a * (2.0(i / W) + (j / H) - 1.0)
+                φ[j,i] += cfg.atm * turb + ramp
+            end
+        end
+    end
+    coh = Matrix{Float64}(undef, H, W)
+    Threads.@threads for j in 1:H
+        for i in 1:W
+            g0 = φ[j,i]
+            gx = i < W ? φ[j,i+1] : g0; gpx = i > 1 ? φ[j,i-1] : g0
+            gy = j > 1 ? φ[j-1,i] : g0; gpy = j < H ? φ[j+1,i] : g0
+            grad = max(abs(gx - gpx), abs(gy - gpy)) / 2
+            coh[j,i] = clamp(cfg.coh * exp(-grad / 2.2), 0.05, 1.0)
+        end
+    end
+    out = Array{UInt8}(undef, H, W, 3)
+    looks = 4
+    Threads.@threads for j in 1:H
+        for i in 1:W
+            g = coh[j,i]
+            σ = clamp(sqrt(max(1.0 - g^2, 1e-9) / (2.0 * looks * max(g^2, 1e-6))),
+                      0.02, 2.5)
+            ph = φ[j,i] + σ * randn()
+            rgb = insar_cmap(mod(ph / (2π), 1.0))
+            lum = (0.299img[j,i,1] + 0.587img[j,i,2] + 0.114img[j,i,3]) / 255.0
+            f = 0.30 + 0.85 * lum
+            out[j,i,1] = to8(rgb[1] * f)
+            out[j,i,2] = to8(rgb[2] * f)
+            out[j,i,3] = to8(rgb[3] * f)
+        end
+    end
+    stats = (max_los_cm = maximum(abs, dlos) * 100.0,
+             fringes = maximum(abs, dlos) / (lam / 2),
+             mean_coh = sum(coh) / (H * W))
+    return out, stats
+end
+
+# ----------------------------------------------------------------------------
 # 12. CLI
 # ----------------------------------------------------------------------------
 
@@ -756,6 +1145,11 @@ function usage()
       terrain         satellite picture only
       sar             SAR amplitude image only
       insar           interferogram suite only (satellite skipped)
+      s2              REAL Sentinel-2 satellite picture (ESA Copernicus
+                      cloudless mosaic via the open EOX tile service, no
+                      key): --place NAME or --lat/--lon; add --insar to
+                      draw a simulated interferogram on top of the real
+                      image
       places          list real-elevation places
       help            this text
       <place>         shortcut, e.g. `etna` = real DEM + satellite + InSAR
@@ -771,6 +1165,13 @@ function usage()
                       and the same command resumes on rerun (default: off)
       --fast          aggressive API pacing (only if you are not hitting the
                       rate limit; the tool self-throttles otherwise)
+      --lat N --lon N   location for s2, decimal degrees
+      --zoom Z        web-mercator zoom for s2 (default 11; ~76 m/px at
+                      lat 37 for the 10 m Sentinel-2 mosaic)
+      --tiles N|AxB  s2 tile grid, 256 px each (default 4 = 4x4)
+      --year Y       s2cloudless mosaic year (2017-2023, default 2023)
+      --insar        s2: also render a simulated interferogram on top
+      --label NAME   s2: output filename label (default: place or lon_lat)
       --source S      mogi | dyke | sill | slip | none (default mogi)
       --depth M       source depth in m (default 3500 synthetic / per place)
       --cm X          max LOS displacement in cm (default 14)
@@ -851,7 +1252,7 @@ function main()
         println("  ", join(sort(collect(keys(PLACES))), ", "))
         return
     end
-    if cmd ∉ ("demo", "terrain", "sar", "insar", "place")
+    if cmd ∉ ("demo", "terrain", "sar", "insar", "place", "s2")
         println("unknown command '", cmd, "' -- try `help`")
         return
     end
@@ -861,6 +1262,81 @@ function main()
     seed = Int(num(opts, "seed", 1.0))
     clouds = !haskey(opts, "noclouds")
     println("insar_sat.jl -- mode: ", cmd, place == "" ? "" : " (" * place * ")")
+
+    # ----------------------------------------------------- real Sentinel-2 --
+    if cmd == "s2"
+        lat = num(opts, "lat", NaN)
+        lon = num(opts, "lon", NaN)
+        label = get(opts, "label", "")
+        if place != ""
+            pi_info = PLACES[place]
+            lat = pi_info.summit[1]
+            lon = pi_info.summit[2]
+            label == "" && (label = place)
+        else
+            (isnan(lat) || isnan(lon)) &&
+                error("s2 needs --lat and --lon (or --place NAME)")
+            label == "" && (label = string(round(lon, digits = 3)) * "_" *
+                                   string(round(lat, digits = 3)))
+        end
+        year = Int(num(opts, "year", 2023.0))
+        year in (2017, 2018, 2019, 2020, 2021, 2022, 2023) ||
+            println("  warning: mosaic year ", year,
+                    " may not exist (2017-2023); trying anyway")
+        zoom = clamp(Int(num(opts, "zoom", 11.0)), 1, 17)
+        tspec = get(opts, "tiles", "4")
+        local nx::Int, ny::Int
+        if occursin('x', tspec)
+            a, b = split(tspec, 'x')
+            nx = clamp(parse(Int, a), 1, 8)
+            ny = clamp(parse(Int, b), 1, 8)
+        else
+            nx = ny = clamp(parse(Int, tspec), 1, 8)
+        end
+        println("  source: Sentinel-2 ", year, " cloudless mosaic (ESA via EOX)")
+        println("  tiles ", nx, "x", ny, " @ zoom ", zoom)
+        img, tx0, ty0 = s2_fetch_tiles(lat, lon, zoom, nx, ny, year, outdir)
+        write_bmp(joinpath(outdir, "satellite_s2_" * label * ".bmp"), img)
+        px = 156543.03392 * cosd(lat) / 2.0^zoom
+        println("  image ", size(img, 2), "x", size(img, 1),
+                " px, ~", round(px, digits = 1), " m/px at this latitude")
+        if haskey(opts, "insar")
+            source = get(opts, "source", "mogi")
+            depth0 = place == "" ? 3500.0 : PLACES[place].depth
+            srcpars = Dict{String,Float64}(
+                "depth"  => num(opts, "depth", depth0),
+                "strike" => num(opts, "strike", 35.0),
+                "length" => num(opts, "length", 8000.0))
+            H, W = size(img, 1), size(img, 2)
+            local xc::Float64, yc::Float64
+            if haskey(opts, "x") || haskey(opts, "y")
+                xc = 1 + num(opts, "x", 0.5) * (W - 1)
+                yc = 1 + num(opts, "y", 0.5) * (H - 1)
+            elseif place != ""
+                xc, yc = s2_pixel_of(PLACES[place].summit[1],
+                                     PLACES[place].summit[2], zoom, tx0, ty0)
+            else
+                xc = W / 2; yc = H / 2
+            end
+            cfg = (source = source, srcpars = srcpars, xc = xc, yc = yc,
+                   cm = num(opts, "cm", 14.0),
+                   heading = num(opts, "heading", 193.0),
+                   inc = num(opts, "inc", 35.0),
+                   lam_cm = num(opts, "lambda", 5.55),
+                   atm = num(opts, "atm", 0.35),
+                   coh = num(opts, "coh", 0.9))
+            println("  simulating InSAR over the real image: ", source,
+                    " source, depth ", round(Int, srcpars["depth"]),
+                    " m, max ", cfg.cm, " cm LOS")
+            img_i, stats = render_insar_over(img, px, seed, cfg)
+            write_bmp(joinpath(outdir, "interferogram_s2_" * label * ".bmp"),
+                      img_i)
+            @printf("  deformation: %.2f cm max LOS -> %.1f fringes, mean coherence %.3f\n",
+                    stats.max_los_cm, stats.fringes, stats.mean_coh)
+        end
+        println("done.")
+        return
+    end
 
     # ------------------------------------------------------------- terrain --
     local dem::Matrix{Float64}

@@ -36,6 +36,7 @@ Outputs are hand-written 24-bit **BMP** files (same writer style as
 julia insar_sat.jl                  # demo: synthetic island, full suite
 julia insar_sat.jl etna             # real DEM + summit uplift fringes
 julia insar_sat.jl fuji             # ...same for Fuji etc.
+julia insar_sat.jl s2 --place etna --insar  # REAL Sentinel-2 + fringes
 julia insar_sat.jl places           # list all real-data places
 julia insar_sat.jl help             # all options
 ```
@@ -58,6 +59,38 @@ julia insar_sat.jl insar --atm 0 --coh 0.98 --heading 347 --cm 18
 # Iceland dyke intrusion across the peninsula, grid refetch
 julia insar_sat.jl reykjanes --source dyke --depth 2500 --cm 20
 ```
+
+## Real Sentinel-2 imagery (`s2` command)
+
+```bash
+# real ESA Sentinel-2 pixels of any place on Earth — no API key
+julia insar_sat.jl s2 --place etna --zoom 12 --tiles 4
+# same, with a simulated interferogram drawn over the real image
+julia insar_sat.jl s2 --place etna --zoom 12 --tiles 4 --insar --cm 18
+# any coordinate, any year of the mosaic
+julia insar_sat.jl s2 --lat 37.50 --lon 15.09 --zoom 12 --year 2021
+```
+
+- data: the **ESA Copernicus "Sentinel-2 cloudless" mosaic** (10 m/px
+  base imagery) served as open WMTS tiles by EOX (`tiles.maps.eox.at`,
+  free, no key, no account); mosaics exist for **2017–2023**
+- the tiles are baseline JPEG (SOF0, 4:2:0, no restarts) — they are decoded
+  by a **baseline JPEG decoder written in pure Julia stdlib** (Huffman,
+  dequant, IDCT, YCbCr→RGB — `LinearAlgebra` is the only extra stdlib),
+  so the tool keeps its zero-package promise; the decoder was validated
+  byte-for-byte against an independent reference decoder
+- `--zoom 11..13` ≈ 122..30 m/px (at lat 37.5), `--tiles N|AxB` up to
+  8×8 tiles (2048 px); missing tiles are filled dark and reported
+- `--insar` places a simulated source at the summit (per-place depth) or
+  `--x/--y`/image centre and shades the cyclic rainbow by the real image
+  luminance, so fringes stay readable over real terrain; no DEM → no
+  topographic term and no stratified atmosphere, but turbulent + ramp
+  atmosphere, coherence decay, and phase noise are modelled as usual
+
+**Honesty note:** this is real Sentinel-2 *pixels*, not per-scene products.
+Raw Sentinel-2 scenes, Sentinel-1 SLC data and real interferometry need the
+free **Copernicus Data Space Ecosystem** account plus SNAP/ISCE processing
+(multi-GB downloads) — out of scope for a stdlib tool.
 
 ## Real-data notes (Open-Meteo elevation API)
 
