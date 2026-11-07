@@ -2746,7 +2746,7 @@ onto the full ML grid. Returns (lat, lon, hgt_ann, DEM), H x W matrices."""
 function dem_for_ml_block(ann::S1Annotation, l0::Int, p0::Int,
                           mla::Int, mlr::Int, H::Int, W::Int;
                           stride::Int = 4, outdir::String = "insar_out",
-                          label::String = "b", gap::Float64 = 4.0)
+                          label::String = "b", gap::Float64 = 0.3)
     stride = max(1, min(stride, H - 1, W - 1))
     ul, up, LAT, LON, HGT = s1_gcp_grid(ann)
     lat = Matrix{Float64}(undef, H, W)
