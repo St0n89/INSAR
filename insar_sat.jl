@@ -2522,10 +2522,43 @@ function raw_ifg(annP::S1Annotation, tiffP_path::String, tP::SlcTiff;
     @printf("  unwrapped %d / %d coherent px (%.1f %%)\n",
         count(!isnan, unw), count(mask), 100frac)
     img, imgc, imgd, dcm, stats = render_real_insar(pha, coh, unw, lam_cm, cohthr)
-    write_bmp(joinpath(outdir, "interferogram_" * label * ".bmp"), img)
     write_bmp(joinpath(outdir, "coherence_" * label * ".bmp"), imgc)
     write_bmp(joinpath(outdir, "unwrapped_" * label * ".bmp"), imgd)
-    @printf("  wrote interferogram/coherence/unwrapped BMPs to %s\n", outdir)
+
+    # --- nicer renderings (v4.1): display mask + filtered + detrended ---------
+    # display mask stricter than --coh: ocean/low-coherence speckle would
+    # otherwise read as deformation structure
+    dmask = (coh .>= max(cohthr, 0.35)) .& (.!isnan.(unw))
+    nice = false
+    if count(dmask) > 500
+        cf = filter_ifg_cpx(ifg, coh, dmask; r = 2)
+        imgf = render_phase_img(angle.(cf), dmask)
+        coef = quadfit_cm(dcm, dmask)
+        if coef !== nothing
+            fitm = quad_eval(coef, size(dcm))
+            utr = -4π .* fitm ./ lam_cm          # trend in unwrapped-phase rad
+            pha_dt = angle.(cf .* exp.(-1im .* utr))
+            write_bmp(joinpath(outdir,
+                "interferogram_detrended_" * label * ".bmp"),
+                render_phase_img(pha_dt, dmask))
+            dres = dcm .- fitm
+            dres = filter_real(dres, coh, dmask; r = 4)   # display copy (9x9)
+            s = defo_scale(dres, dmask)
+            write_bmp(joinpath(outdir, "unwrapped_defo_" * label * ".bmp"),
+                upscale_img(render_defo_img(dres, dmask, s), 3))
+            @printf("  wrote detrended IFG + deformation map (scale ±%.1f cm, mask coh≥%.2f, %d px)\n",
+                s, max(cohthr, 0.35), count(dmask))
+            nice = true
+            write_bmp(joinpath(outdir, "interferogram_" * label * ".bmp"), imgf)
+        end
+    end
+    if !nice
+        write_bmp(joinpath(outdir, "interferogram_" * label * ".bmp"), img)
+        @printf("  wrote interferogram/coherence/unwrapped BMPs to %s\n", outdir)
+    else
+        @printf("  wrote filtered interferogram + coherence/unwrapped/defo BMPs to %s\n",
+            outdir)
+    end
 
     # --- deformation summary (real pairs, after topo removal) -----------------
     # Robust estimate of the deformation signal: least-squares 2-D quadratic
@@ -4376,6 +4409,132 @@ function render_real_insar(pha::Matrix{Float64}, coh::Matrix{Float64},
              nunw = count(x -> !isnan(x), unw),
              ncoh = count(mask))
     return img, imgc, imgd, dcm, stats
+end
+
+# ---- nicer real-pair renderings: masked, filtered, detrended (v4.1) ---------
+
+"""Coherence-weighted masked boxcar filter on a complex interferogram.
+`r` = half-width (5x5 at r=2 on the multilooked grid): smooths speckle
+without wiping the dense fringes near the vent. Masked pixels carry no
+weight; a pixel whose whole window is masked falls back to itself."""
+function filter_ifg_cpx(c::Matrix{ComplexF64}, coh::Matrix{Float64},
+                        mask::AbstractMatrix{Bool}; r::Int = 2)
+    H, W = size(c)
+    out = zeros(ComplexF64, H, W)
+    @inbounds for j in 1:H, i in 1:W
+        acc = zero(ComplexF64); ws = 0.0
+        for dj in -r:r, di in -r:r
+            jj = clamp(j + dj, 1, H); ii = clamp(i + di, 1, W)
+            if mask[jj, ii]
+                wt = coh[jj, ii]
+                acc += wt * c[jj, ii]; ws += wt
+            end
+        end
+        out[j, i] = ws > 0 ? acc / ws : c[j, i]
+    end
+    return out
+end
+
+"""LSQ 2-D quadratic (1, x, z, x^2, xz, z^2) of dcm [cm] over masked
+pixels; returns coefficients or nothing when too few points."""
+function quadfit_cm(dcm::Matrix{Float64}, mask::AbstractMatrix{Bool})
+    idx = [k for k in eachindex(dcm) if mask[k] && !isnan(dcm[k])]
+    length(idx) < 200 && return nothing
+    Hm, Wm = size(dcm)
+    X = zeros(length(idx), 6); y = zeros(length(idx))
+    for (n, k) in enumerate(idx)
+        r, c = Tuple(CartesianIndices(dcm)[k])
+        x = (c - 0.5) / Wm - 0.5; z = (r - 0.5) / Hm - 0.5
+        X[n, :] .= (1.0, x, z, x * x, x * z, z * z)
+        y[n] = dcm[k]
+    end
+    return (X' * X) \ (X' * y)
+end
+
+"""Evaluate a quadfit_cm coefficient vector on the full grid."""
+function quad_eval(coef::Vector{Float64}, sz::Tuple{Int,Int})
+    Hm, Wm = sz
+    out = zeros(Hm, Wm)
+    @inbounds for j in 1:Hm, i in 1:Wm
+        x = (i - 0.5) / Wm - 0.5; z = (j - 0.5) / Hm - 0.5
+        out[j, i] = coef[1] + coef[2] * x + coef[3] * z +
+                    coef[4] * x * x + coef[5] * x * z + coef[6] * z * z
+    end
+    return out
+end
+
+"""98th-percentile symmetric display scale for a detrended map [cm]."""
+function defo_scale(dres::Matrix{Float64}, mask::AbstractMatrix{Bool})
+    v = [abs(dres[k]) for k in eachindex(dres) if mask[k] && !isnan(dres[k])]
+    isempty(v) && return 1.0
+    sort!(v)
+    return max(v[round(Int, 0.98 * length(v))], 0.5)
+end
+
+"""Coh-weighted masked boxcar filter on a REAL field (use after detrending:
+the residual is smooth, so averaging kills per-pixel noise ~window size)."""
+function filter_real(v::Matrix{Float64}, coh::Matrix{Float64},
+                     mask::AbstractMatrix{Bool}; r::Int = 2)
+    H, W = size(v)
+    out = zeros(H, W)
+    @inbounds for j in 1:H, i in 1:W
+        acc = 0.0; ws = 0.0
+        for dj in -r:r, di in -r:r
+            jj = clamp(j + dj, 1, H); ii = clamp(i + di, 1, W)
+            if mask[jj, ii] && !isnan(v[jj, ii])
+                wt = coh[jj, ii]
+                acc += wt * v[jj, ii]; ws += wt
+            end
+        end
+        out[j, i] = ws > 0 ? acc / ws : v[j, i]
+    end
+    return out
+end
+
+"""Nearest-neighbour upscale of an RGB image (f in each axis)."""
+function upscale_img(img::Array{UInt8,3}, f::Int)
+    H, W = size(img, 1), size(img, 2)
+    out = Array{UInt8}(undef, H * f, W * f, 3)
+    @inbounds for j in 1:H, i in 1:W
+        for dj in 1:f, di in 1:f
+            for c in 1:3
+                out[(j - 1) * f + dj, (i - 1) * f + di, c] = img[j, i, c]
+            end
+        end
+    end
+    return out
+end
+
+"""Wrapped-phase fringe image; masked-out pixels dark (near-black)."""
+function render_phase_img(pha::Matrix{Float64}, mask::AbstractMatrix{Bool})
+    H, W = size(pha)
+    img = Array{UInt8}(undef, H, W, 3)
+    @inbounds for j in 1:H, i in 1:W
+        if mask[j, i]
+            rgb = insar_cmap(mod(pha[j, i] / (2π), 1.0))
+            img[j, i, 1] = to8(rgb[1]); img[j, i, 2] = to8(rgb[2])
+            img[j, i, 3] = to8(rgb[3])
+        else
+            img[j, i, 1] = 18; img[j, i, 2] = 18; img[j, i, 3] = 26
+        end
+    end
+    return img
+end
+
+"""Symmetric (+-s) deformation map; masked-out pixels dark."""
+function render_defo_img(dres::Matrix{Float64}, mask::AbstractMatrix{Bool}, s::Float64)
+    H, W = size(dres)
+    img = Array{UInt8}(undef, H, W, 3)
+    @inbounds for j in 1:H, i in 1:W
+        if mask[j, i] && !isnan(dres[j, i])
+            c2 = disp_cmap(clamp((dres[j, i] / s + 1.0) / 2.0, 0.0, 1.0))
+            img[j, i, 1] = to8(c2[1]); img[j, i, 2] = to8(c2[2])
+            img[j, i, 3] = to8(c2[3])
+        else
+            img[j, i, 1] = 24; img[j, i, 2] = 24; img[j, i, 3] = 30
+        end
+    end
+    return img
 end
 
 # ----------------------------------------------------------------------------
