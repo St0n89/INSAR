@@ -3453,7 +3453,9 @@ function asf_presigned(prodname::String, tok::String)::Tuple{String,Int}
     rc, code, head, _ = http_get(u1, ["Authorization: Bearer " * tok];
                                 rng = "0-0", timeout_s = 60)
     loc = http_location(head)
-    if code == 303 && !isempty(loc)
+    # accept any redirect (303 on HTTP/2, 302 seen on Windows/HTTP/1.1);
+    # the Location is the presigned CloudFront URL either way
+    if code in (301, 302, 303, 307, 308) && !isempty(loc)
         rc2, code2, head2, _ = http_get(loc; rng = "0-0", timeout_s = 60)
         (rc2 == 0 && code2 == 206) || error("presigned probe failed (rc=$rc2 code=$code2)")
         m = match(r"content-range:\s*bytes\s+(\d+)-(\d+)/(\d+)", lowercase(head2))
