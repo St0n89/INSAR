@@ -2374,6 +2374,7 @@ function raw_ifg(annP::S1Annotation, tiffP_path::String, tP::SlcTiff;
                  vlat::Float64 = NaN, vlon::Float64 = NaN,
                  vname::String = "Geldingadalur",
                  mtitle::String = "LOS deformation",
+                 unwr::String = "wls",
                  outdir::String = "insar_out")
     annS === nothing && (annS = annP)
     tS === nothing && (tS = read_slc_tiff(tiffS_path))
@@ -2518,9 +2519,18 @@ function raw_ifg(annP::S1Annotation, tiffP_path::String, tP::SlcTiff;
         mla, mlr, H, W, sum(coh) / length(coh))
 
     # --- unwrap + render ----------------------------------------------------
-    mask = (coh .>= cohthr)
+    mask = (coh .>= cohthr) .& (.!isnan.(pha))
     count(mask) == 0 && error("no coherent pixels -- lower --coh")
-    unw = unwrap_quality(pha, coh, mask)
+    local unw
+    if lowercase(unwr) == "wls"
+        println("  unwrapping (weighted least squares: qg init + Poisson CG + L1 reweight)...")
+        unw = unwrap_wls(pha, coh, mask)
+    elseif lowercase(unwr) == "qg"
+        println("  unwrapping (quality-guided flood fill, coherence-ordered)...")
+        unw = unwrap_quality(pha, coh, mask)
+    else
+        error("unknown --unwrap mode '", unwr, "' (qg | wls)")
+    end
     frac = count(!isnan, unw) / count(mask)
     @printf("  unwrapped %d / %d coherent px (%.1f %%)\n",
         count(!isnan, unw), count(mask), 100frac)
@@ -3923,7 +3933,7 @@ end
 """raw pair: catalogue search + ASF download + auto block + interferogram.
 Options: --lat --lon --date --date2 [--dtol N] [--pass auto|desc|asc]
 [--topo] [--nlines N] [--npix N] [--coh C] [--datadir DIR]
-[--vname NAME]  (with --topo: native Vedurstofa-style LOS map BMP)"""
+[--vname NAME] [--unwrap qg|wls]  (with --topo: native Vedurstofa-style LOS map BMP)"""
 function raw_pair_driver(opts::Dict{String,String}, outdir::String)
     lat = num(opts, "lat", NaN)
     lon = num(opts, "lon", NaN)
@@ -3984,6 +3994,7 @@ function raw_pair_driver(opts::Dict{String,String}, outdir::String)
             burst = kk, l0 = l0, l1 = l1, p0 = p0, p1 = p1,
             topo = haskey(opts, "topo"),
             cohthr = num(opts, "coh", 0.15),
+            unwr = get(opts, "unwrap", "wls"),
             vlat = lat, vlon = lon,
             vname = get(opts, "vname", "Geldingadalur"),
             mtitle = "LOS deformation (" * replace(d1, "-" => "") * "-" *
@@ -4473,6 +4484,200 @@ function unwrap_quality(pha::Matrix{Float64}, coh::Matrix{Float64},
                 qg_push!(heap, coh[jj,ii], (jj - 1) * W + ii)
             end
         end
+    end
+    return unw
+end
+
+# weighted least-squares (Poisson) unwrapping, matrix-free:
+#   minimize over u   sum_edges  w_ij ((u_i - u_j) - d_ij)^2
+# with d_ij = wrapd(pha_i - pha_j) (Itoh) and w_ij = coh_i * coh_j. This is
+# the global whole-image version of what the QG flood fill integrates along
+# a single path: one bad branch decision can no longer propagate, because
+# every pixel value is a compromise over ALL its weighted neighbour
+# differences. The weighted Laplacian is applied as a 4-neighbour stencil
+# (no sparse arrays), solved with Jacobi-preconditioned conjugate
+# gradients, warm-started from the QG flood-fill solution so CG converges
+# fast. `irls` reweight passes then downweight edges whose residual exceeds
+# eps_l1 rad (iteratively reweighted least squares -> L1/TV behaviour:
+# noise-smoothed integration, but true discontinuities and undersampled
+# fringe fronts survive). Connected components other than the main region
+# get their own gauge (anchored at their best-coherence pixel, u = 0), so
+# coherent islands stay internally consistent. A final congruence pass
+# re-attaches the wrapped phase, making the product structurally
+# equivalent to the QG result (u == pha mod 2pi everywhere).
+function unwrap_wls(pha::Matrix{Float64}, coh::Matrix{Float64},
+                    mask::AbstractMatrix{Bool};
+                    irls::Int = 2, eps_l1::Float64 = 0.4,
+                    cg_tol::Float64 = 1e-4, cg_max::Int = 20000,
+                    verbose::Bool = true)::Matrix{Float64}
+    H, W = size(pha)
+    unw = fill(NaN, H, W)
+    eff = mask .& (.!isnan.(pha))          # NaN-phase px cannot be integrated
+    n = count(eff)
+    n == 0 && return unw
+    t0 = time()
+    # NOTE on indexing: every array access below is CARTESIAN. Never mix
+    # formula-based linear indices ((j-1)*W+i) with real array accesses:
+    # this file also runs under interpreters whose linear indexing is not
+    # column-major, and the existing heap/stack round-trips (encode here,
+    # decode with the same formula, never index an array) are layout-safe.
+    # k <-> (pj[k], pi[k]) is the single source of truth for pixel order.
+    lin = zeros(Int, H, W)                  # lin[j,i] = k (0 = not in mask)
+    pj  = Vector{Int}(undef, n)
+    pi  = Vector{Int}(undef, n)
+    k = 0
+    for j in 1:H, i in 1:W
+        if eff[j, i]
+            k += 1
+            lin[j, i] = k
+            pj[k] = j; pi[k] = i
+        end
+    end
+    # 4 fixed neighbour directions per pixel: 1:(j,i-1)  2:(j,i+1)  E edges
+#                                        3:(j-1,i)  4:(j+1,i)  N edges
+    # (0 = none outside the mask). Edge factors: E edge (j,i)-(j,i+1) ->
+    # fE[j,i]; N edge (j,i)-(j+1,i) -> fN[j,i].
+    nb = zeros(Int, n, 4)
+    @inbounds for kk in 1:n
+        j = pj[kk]; i = pi[kk]
+        i > 1 && lin[j, i - 1] > 0 && (nb[kk, 1] = lin[j, i - 1])
+        i < W && lin[j, i + 1] > 0 && (nb[kk, 2] = lin[j, i + 1])
+        j > 1 && lin[j - 1, i] > 0 && (nb[kk, 3] = lin[j - 1, i])
+        j < H && lin[j + 1, i] > 0 && (nb[kk, 4] = lin[j + 1, i])
+    end
+    # connected components; anchor each at its best-coherence pixel (u = 0)
+    comp = zeros(Int, H, W)
+    anch = falses(n)
+    ncomp = 0
+    for kk in 1:n
+        comp[pj[kk], pi[kk]] > 0 && continue
+        ncomp += 1
+        stack = Int[kk]                     # stack of k indices
+        comp[pj[kk], pi[kk]] = ncomp
+        bestc = -1.0; bestk = 0
+        while !isempty(stack)
+            p = pop!(stack)
+            jj = pj[p]; ii = pi[p]
+            if coh[jj, ii] > bestc
+                bestc = coh[jj, ii]; bestk = p
+            end
+            for (dj, di) in ((-1, 0), (1, 0), (0, -1), (0, 1))
+                j2 = jj + dj; i2 = ii + di
+                if 1 <= j2 <= H && 1 <= i2 <= W && eff[j2, i2] &&
+                   comp[j2, i2] == 0
+                    comp[j2, i2] = ncomp
+                    push!(stack, lin[j2, i2])
+                end
+            end
+        end
+        anch[bestk] = true
+    end
+    # warm start: QG flood fill, unreached pixels 0
+    u = unwrap_quality(pha, coh, eff)
+    qgfrac = count(!isnan, u) / n
+    x = Vector{Float64}(undef, n)
+    for kk in 1:n
+        x[kk] = isnan(u[pj[kk], pi[kk]]) ? 0.0 : u[pj[kk], pi[kk]]
+    end
+    verbose && @printf("  wls: %d coherent px, %d component(s), qg warm start %.1f %%\n",
+                       n, ncomp, 100qgfrac)
+    cohv = Vector{Float64}(undef, n)
+    for kk in 1:n
+        cohv[kk] = coh[pj[kk], pi[kk]]
+    end
+    d = zeros(n); b = zeros(n)
+    fE = fill(1.0, H, W)
+    fN = fill(1.0, H, W)
+    # matrix-free operator: weighted Laplacian (anchor rows -> identity)
+    applyA!(y, v) = begin
+        @inbounds for kk in 1:n
+            if anch[kk]
+                y[kk] = v[kk]
+            else
+                j = pj[kk]; i = pi[kk]
+                ci = cohv[kk]
+                acc = d[kk] * v[kk]
+                q = nb[kk, 1]
+                q > 0 && !anch[q] && (acc -= ci * cohv[q] * fE[j, i - 1] * v[q])
+                q = nb[kk, 2]
+                q > 0 && !anch[q] && (acc -= ci * cohv[q] * fE[j, i] * v[q])
+                q = nb[kk, 3]
+                q > 0 && !anch[q] && (acc -= ci * cohv[q] * fN[j - 1, i] * v[q])
+                q = nb[kk, 4]
+                q > 0 && !anch[q] && (acc -= ci * cohv[q] * fN[j, i] * v[q])
+                y[kk] = acc
+            end
+        end
+        return y
+    end
+    r  = Vector{Float64}(undef, n)
+    z  = similar(r); p = similar(r); Ap = similar(r)
+    iters = 0
+    for pass in 0:irls
+        # assemble diagonal / rhs with the current edge factors
+        fill!(d, 0.0); fill!(b, 0.0)
+        @inbounds for kk in 1:n
+            anch[kk] && (d[kk] = 1.0; continue)
+            j = pj[kk]; i = pi[kk]
+            ci = cohv[kk]
+            q = nb[kk, 1]
+            q > 0 && (w = ci * cohv[q] * fE[j, i - 1]; d[kk] += w;
+                      b[kk] += w * wrapd(pha[j, i] - pha[j, i - 1]))
+            q = nb[kk, 2]
+            q > 0 && (w = ci * cohv[q] * fE[j, i]; d[kk] += w;
+                      b[kk] += w * wrapd(pha[j, i] - pha[j, i + 1]))
+            q = nb[kk, 3]
+            q > 0 && (w = ci * cohv[q] * fN[j - 1, i]; d[kk] += w;
+                      b[kk] += w * wrapd(pha[j, i] - pha[j - 1, i]))
+            q = nb[kk, 4]
+            q > 0 && (w = ci * cohv[q] * fN[j, i]; d[kk] += w;
+                      b[kk] += w * wrapd(pha[j, i] - pha[j + 1, i]))
+        end
+        # Jacobi-preconditioned CG (warm-started x)
+        applyA!(Ap, x); r .= b .- Ap
+        z .= r ./ d; p .= z
+        rz = dot(r, z)
+        bnorm = norm(b)
+        tol2 = (cg_tol * bnorm)^2
+        it = 0
+        while it < cg_max && dot(r, r) > tol2
+            applyA!(Ap, p)
+            alpha = rz / dot(p, Ap)
+            x .+= alpha .* p
+            r .-= alpha .* Ap
+            z .= r ./ d
+            rznew = dot(r, z)
+            p .= z .+ (rznew / rz) .* p
+            rz = rznew
+            it += 1
+        end
+        iters += it
+        verbose && @printf("  wls: pass %d/%d  cg %d iters, |r|/|b| = %.1e\n",
+                           pass + 1, irls + 1, it,
+                           sqrt(dot(r, r)) / max(bnorm, 1e-12))
+        # IRLS reweight: soften edges with residuals beyond eps_l1 rad
+        if pass < irls
+            @inbounds for kk in 1:n
+                j = pj[kk]; i = pi[kk]
+                q = nb[kk, 2]
+                if q > 0
+                    res = (x[kk] - x[q]) - wrapd(pha[j, i] - pha[j, i + 1])
+                    fE[j, i] *= 1.0 / sqrt(1.0 + (res / eps_l1)^2)
+                end
+                q = nb[kk, 4]
+                if q > 0
+                    res = (x[kk] - x[q]) - wrapd(pha[j, i] - pha[j + 1, i])
+                    fN[j, i] *= 1.0 / sqrt(1.0 + (res / eps_l1)^2)
+                end
+            end
+        end
+    end
+    verbose && @printf("  wls: total %d cg iterations, %.1f s\n",
+                       iters, time() - t0)
+    # congruence: re-attach the wrapped phase (u == pha mod 2pi)
+    for kk in 1:n
+        j = pj[kk]; i = pi[kk]
+        unw[j, i] = pha[j, i] + 2π * round((x[kk] - pha[j, i]) / (2π))
     end
     return unw
 end
@@ -5300,9 +5505,11 @@ function usage()
                         raw ifg     --ann XML --tiff TIFF [--ann2 XML --tiff2 X]
                                       [--sim] [--topo] [--mla A] [--mlr R]
                                       [--burst N] [--tdl D] [--tdp P] [--coh C]
+                                      [--unwrap qg|wls]
                         raw pair    --lat F --lon F --date D1 --date2 D2
                                       [--dtol N] [--pass auto|desc|asc] [--topo]
                                       [--nlines N] [--npix N] [--datadir DIR]
+                                      [--unwrap qg|wls]
                                       (end-to-end: CDSE catalogue search, ASF
                                       range-ZIP download (Earthdata token in
                                       earthdata.env or EARTHDATA_TOKEN), auto
@@ -5566,6 +5773,7 @@ function main()
                 vlon = num(opts, "vlon", NaN),
                 vname = get(opts, "vname", "Geldingadalur"),
                 mtitle = get(opts, "mtitle", "LOS deformation"),
+                unwr = get(opts, "unwrap", "wls"),
                 outdir = outdir)
         elseif sub == "dem"
             T === nothing && error("raw dem needs --tiff <slc measurement>")
@@ -5655,8 +5863,14 @@ function main()
         lam_cm = num(opts, "lambda", 5.55)
         mask = (coh .>= cohthr) .& (.!isnan.(pha))
         count(mask) == 0 && error("no coherent pixels -- lower the --coh threshold")
-        println("  unwrapping (quality-guided flood fill, coherence-ordered)...")
-        unw = unwrap_quality(pha, coh, mask)
+        local unw
+        if lowercase(get(opts, "unwrap", "wls")) == "wls"
+            println("  unwrapping (weighted least squares: qg init + Poisson CG + L1 reweight)...")
+            unw = unwrap_wls(pha, coh, mask)
+        else
+            println("  unwrapping (quality-guided flood fill, coherence-ordered)...")
+            unw = unwrap_quality(pha, coh, mask)
+        end
         frac = count(!isnan, unw) / count(mask)
         @printf("  unwrapped %d / %d coherent px (%.1f %%)\n",
                 count(!isnan, unw), count(mask), 100frac)
