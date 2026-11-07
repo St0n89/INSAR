@@ -1658,6 +1658,346 @@ function fft_c!(x::Vector{ComplexF64}, forward::Bool = true)
                 u = x[base + k]
                 v = x[base + k + len ÷ 2] * w
                 x[base + k] = u + v
+                x[base + k + len ÷ 2] = u - v
+                w *= wl
+            end
+        end
+        len <<= 1
+    end
+    return x
+end
+
+# ---- TOPS deramp / reramp / azimuth shift ------------------------------
+# Focused TOPS SLC bursts are in the antenna-steering frame: a stationary
+# target carries residual azimuth phase  pi*ka*(t - tc)^2  (ka from the
+# azimuthFmRate list). Resampling in azimuth must therefore be done in the
+# deramped domain:  deramp(tR) -> shift by dt -> reramp(tR + dt).
+
+"""Apply deramp (dir=-1) or reramp (dir=+1) to a block of global 0-based
+lines [l0, l0+NL), pixels [p0, p0+NP), reference azimuth time tR.
+rate(t, pixel) gives the azimuth phase rate in Hz/s (annotation FM rate for
+stripmap-style ramps, or the measured TOPS steering rate)."""
+function tops_ramp!(blk::Matrix{ComplexF32}, ann::S1Annotation,
+                    l0::Int, p0::Int, tR::Float64, dir::Int,
+                    rate::Function)
+    NL, NP = size(blk)
+    for i in 1:NL
+        t = s1_line_az_time(ann, l0 + i - 1)
+        dt2 = (t - tR) * (t - tR)
+        @inbounds for j in 1:NP
+            k = rate(t, p0 + j - 1)
+            ph = dir * pi * k * dt2
+            blk[i, j] *= ComplexF32(cos(ph), sin(ph))
+        end
+    end
+    return blk
+end
+
+"""Measure the TOPS steering-phase rate K empirically: the scene-wide
+adjacent-line Doppler of strong unsaturated pixels ramps linearly through
+the burst (the antenna beam sweeps); after deramp with rate K every
+stationary target sits at baseband at its own position. Returns (K0, K1):
+K(pixel) = K0 + K1*(pixel - p0), fitted linearly across range groups."""
+function measure_tops_rate(blk::Matrix{ComplexF32}, ann::S1Annotation,
+                           l0::Int, p0::Int; ngroups::Int = 6,
+                           ampthr::Float64 = 0.0)
+    NL, NP = size(blk)
+    if ampthr <= 0.0
+        # adaptive threshold: healthy SLC DNs are small (speckle RMS
+        # ~30-600), so calibrate on the block itself (~3 sigma).
+        tot = 0.0
+        for c in blk; tot += abs2(c); end
+        ampthr = max(3.0 * sqrt(tot / length(blk)), 60.0)
+    end
+    fs = 1.0 / ann.azimuth_dt
+    Ks = Float64[]; pmids = Int[]
+    for g in 1:ngroups
+        j0 = (g - 1) * (NP ÷ ngroups) + 1
+        j1 = g == ngroups ? NP : g * (NP ÷ ngroups)
+        fline = Float64[]
+        for i in 1:NL-1
+            s = 0.0 + 0.0im
+            @inbounds for j in j0:j1
+                a1 = abs(blk[i, j]); a2 = abs(blk[i + 1, j])
+                if ampthr < a1 < 32000 && ampthr < a2 < 32000
+                    s += ComplexF64(blk[i + 1, j]) *
+                         conj(ComplexF64(blk[i, j]))
+                end
+            end
+            abs(s) > 0 && push!(fline, angle(s) / (2pi * ann.azimuth_dt))
+        end
+        length(fline) < 50 && continue
+        for i in 2:length(fline)         # de-alias by continuity
+            while fline[i] - fline[i-1] > fs / 2; fline[i] -= fs; end
+            while fline[i] - fline[i-1] < -fs / 2; fline[i] += fs; end
+        end
+        n = length(fline)
+        xs = collect(Float64, 1:n)
+        # robust slope: least squares, 3-sigma outlier clip, refit (twice).
+        # Noisy sparse fline (speckle-only blocks) can otherwise produce
+        # fs-aliased runaway slopes (observed: 30 kHz/s vs ~1.4 kHz/s true).
+        slope = 0.0
+        keep = trues(n)
+        for _ in 1:3
+            nk = count(keep)
+            nk >= 10 || break
+            mx = sum(xs[keep]) / nk; my = sum(fline[keep]) / nk
+            sxx = sum((xs[i] - mx)^2 for i in 1:n if keep[i])
+            slope = sum((xs[i] - mx) * (fline[i] - my) for i in 1:n if keep[i]) / sxx
+            resid = [abs(fline[i] - my - slope * (xs[i] - mx)) for i in 1:n]
+            sd = sqrt(sum(resid[keep] .^ 2) / max(nk - 2, 1))
+            keep = [r < 3.0 * max(sd, 1e-9) for r in resid]
+        end
+        # physical clamp: S1 IW TOPS steering rates are ~0.5-3 kHz/s;
+        # anything above 8 kHz/s is an aliasing artefact -> drop group
+        abs(slope) > 8000.0 * ann.azimuth_dt && continue
+        push!(Ks, slope / ann.azimuth_dt)
+        push!(pmids, (j0 + j1) ÷ 2)
+    end
+    length(Ks) >= 2 || (length(Ks) == 1 && (return (Ks[1], 0.0)))
+    isempty(Ks) && error("steering-rate measurement failed (no strong data?)")
+    # linear fit K(pixel)
+    mx = sum(pmids) / length(pmids); my = sum(Ks) / length(Ks)
+    K1 = sum((pmids[i] - mx) * (Ks[i] - my) for i in 1:length(Ks)) /
+          sum((pmids[i] - mx)^2 for i in 1:length(pmids))
+    K0 = my - K1 * (mx - p0)
+    return (K0, K1)
+end
+
+"""Fractional azimuth shift of a (deramped) block by delta lines, via FFT
+linear phase per column. Circular in NL; keep |delta| << NL."""
+function azimuth_shift!(blk::Matrix{ComplexF32}, delta::Float64, az_dt::Float64)
+    NL, NP = size(blk)
+    n2 = nextpow(2, NL)
+    f = Vector{ComplexF64}(undef, n2)
+    for j in 1:NP
+        fill!(f, 0.0 + 0.0im)
+        @inbounds for i in 1:NL; f[i] = blk[i, j]; end
+        fft_c!(f, true)
+        # time shift by delta lines: unsigned-bin phase e^{-2 pi i k delta / n2}
+        # (the signed-frequency form is only valid for integer delta!)
+        @inbounds for k in 0:n2-1
+            f[k+1] *= exp(-2im * pi * k * delta / n2)
+        end
+        fft_c!(f, false)
+        c = 1.0 / n2
+        @inbounds for i in 1:NL; blk[i, j] = ComplexF32(f[i] * c); end
+    end
+    return blk
+end
+
+"""Exact fractional circular shift of a full power-of-2 vector (keeps the
+whole FFT circle: shift -> shift back is exact to FFT precision)."""
+function azimuth_shift_vec(x::Vector{ComplexF32}, delta::Float64)
+    n2 = length(x)
+    (n2 & (n2 - 1)) == 0 || error("azimuth_shift_vec: length must be power of 2")
+    f = ComplexF64.(x)
+    fft_c!(f, true)
+    @inbounds for k in 0:n2-1
+        f[k+1] *= exp(-2im * pi * k * delta / n2)
+    end
+    fft_c!(f, false)
+    c = 1.0 / n2
+    return ComplexF32[ComplexF32(f[i] * c) for i in 1:n2]
+end
+
+"""Fractional shift of a complex SLC block in RANGE (along rows) by delta
+pixels, via exact bandlimited (zero-padded FFT) interpolation -- the range
+counterpart of azimuth_shift!: out[:,j] = in(:, j + delta). Rows are
+zero-padded to the next power of 2, so no wraparound; the only edge
+artifact is <= |delta| px at the far-range edge (zeros beyond the block).
+Note: unlike a windowed-sinc kernel this is exact for the full SLC range
+band (S1 fills ~87% of Nyquist, where 16-tap kernels lose amplitude)."""
+function range_shift!(blk::Matrix{ComplexF32}, delta::Float64)
+    NL, NP = size(blk)
+    n2 = nextpow(2, NP + 8)
+    f = Vector{ComplexF64}(undef, n2)
+    for i in 1:NL
+        fill!(f, 0.0 + 0.0im)
+        @inbounds for j in 1:NP; f[j] = blk[i, j]; end
+        fft_c!(f, true)
+        # unsigned-bin phase e^{-2 pi i k delta / n2} (as in azimuth_shift!)
+        @inbounds for k in 0:n2-1
+            f[k+1] *= exp(-2im * pi * k * delta / n2)
+        end
+        fft_c!(f, false)
+        c = 1.0 / n2
+        @inbounds for j in 1:NP; blk[i, j] = ComplexF32(f[j] * c); end
+    end
+    return blk
+end
+
+"""Amplitude-weighted mean azimuth power spectrum of a block, plus its
+occupancy (power fraction within +-w Hz of the centroid) and peakiness."""
+function block_spectrum_stats(blk::Matrix{ComplexF32}, az_dt::Float64)
+    NL, NP = size(blk)
+    n2 = nextpow(2, NL)
+    tot = zeros(Float64, n2)
+    f = Vector{ComplexF64}(undef, n2)
+    for j in 1:NP
+        fill!(f, 0.0 + 0.0im)
+        @inbounds for i in 1:NL; f[i] = blk[i, j]; end
+        fft_c!(f, true)
+        tot .+= abs2.(f)
+    end
+    fs = 1.0 / az_dt
+    freqs = [(k <= n2 ÷ 2 ? k : k - n2) * fs / n2 for k in 0:n2-1]
+    cent = sum(freqs .* tot) / sum(tot)
+    occ20 = sum(tot[abs.(freqs .- cent) .< 20]) / sum(tot)
+    occ80 = sum(tot[abs.(freqs .- cent) .< 80]) / sum(tot)
+    peak = maximum(tot) / (sum(tot) / n2)
+    return (cent = cent, occ20 = occ20, occ80 = occ80, peak = peak)
+end
+
+# ---- raw command drivers -----------------------------------------------
+
+function raw_info(ann::S1Annotation, tiffpath::String, t::Union{SlcTiff,Nothing};
+                  scan::Bool = false)
+    @printf("%s-%s pol %s  orbit %d  %s  %s .. %s\n", ann.mission, ann.swath,
+        ann.pol, ann.orbit_abs, ann.pass_dir,
+        Dates.unix2datetime(round(Int, ann.t_start)),
+        Dates.unix2datetime(round(Int, ann.t_stop)))
+    @printf("  image    : %d samples x %d lines\n", ann.nsamples, ann.nlines)
+    @printf("  bursts   : %d x %d lines (=%d)  cycle %.6f s  line dt %.6e s\n",
+        length(ann.bursts), ann.lines_per_burst,
+        length(ann.bursts) * ann.lines_per_burst, ann.burst_cycle, ann.azimuth_dt)
+    @printf("  zero-Doppler burst window %.3f s => overlap %.3f s/burst pair\n",
+        ann.lines_per_burst * ann.azimuth_dt,
+        ann.lines_per_burst * ann.azimuth_dt - ann.burst_cycle)
+    @printf("  slant    : %.1f km (near) .. %.1f km (far)\n",
+        ann.slant_t0 * S1_C / 2e3, s1_slant_time(ann, ann.nsamples - 1) * S1_C / 2e3)
+    @printf("  f0 %.6e Hz  range SR %.6e Hz  PRF-equiv %.1f Hz\n",
+        ann.radar_freq, ann.range_sr, 1.0 / ann.azimuth_dt)
+    @printf("  orbit    : %d state vectors\n", length(ann.orbit.t))
+    @printf("  FM-rate  : %d polys, k_a near range %.1f Hz/s\n",
+        length(ann.fmr), isempty(ann.fmr) ? NaN : ann.fmr[1][3][1])
+    @printf("  DC       : %d polys, data DC near range %.2f Hz\n",
+        length(ann.dce), isempty(ann.dce) ? NaN : ann.dce[1][3][1])
+    # timing validation against GCP azimuth times
+    if !isempty(ann.gcps)
+        emax = 0.0
+        for g in ann.gcps
+            g.line < ann.nlines || continue
+            emax = max(emax, abs(s1_line_az_time(ann, g.line) - g.t_az))
+        end
+        @printf("  timing   : max |line_az_time - GCP t_az| = %.3e s over %d GCPs %s\n",
+            emax, length(ann.gcps), emax < 1e-3 ? "(OK)" : "(CHECK!)")
+    end
+    if t !== nothing
+        @printf("  tiff     : %d x %d, %d strips, first offset %u, bc %u\n",
+            t.width, t.nlines, length(t.strip_offsets),
+            t.strip_offsets[1], t.strip_bytecounts[1])
+        (t.width == ann.nsamples && t.nlines == ann.nlines) ||
+            @printf("  WARNING: tiff dims differ from annotation!\n")
+        if scan
+            println("  amplitude scan (full-width mean per 16th line):")
+            io = open(tiffpath, "r")
+            tmp = Vector{ComplexF32}(undef, t.width)
+            runsum = 0.0; runn = 0; inrun = false
+            for l in 0:16:(t.nlines - 1)
+                read_slc_line!(io, t, l, 0, t.width, tmp)
+                a = sum(abs, tmp) / t.width
+                land = a > 2000.0
+                if land && !inrun
+                    @printf("    land(?) from line %d (mean amp %.0f)\n", l, a)
+                    inrun = true
+                elseif !land && inrun
+                    @printf("    .. to line %d (mean amp %.0f)\n", l, a)
+                    inrun = false
+                end
+            end
+            inrun && @printf("    .. to end of product\n")
+            close(io)
+        end
+    end
+end
+
+function raw_selftest(ann::S1Annotation, tiffpath::String, t::SlcTiff;
+                       burst::Int = length(ann.bursts) - 1,
+                       l0::Int = -1, l1::Int = -1,
+                       p0::Int = 14000, p1::Int = 18000)
+    burst = clamp(burst, 0, length(ann.bursts) - 1)
+    if l0 < 0; l0 = burst * ann.lines_per_burst; end
+    if l1 < 0; l1 = l0 + ann.lines_per_burst - 1; end
+    NL = l1 - l0 + 1
+    NP = p1 - p0 + 1
+    (1 <= NL < t.nlines && 1 <= NP <= t.width) || error("bad block dims")
+    @printf("selftest block: lines %d..%d (burst %d), pixels %d..%d\n",
+        l0, l1, burst, p0, p1)
+    blk = read_slc_block(tiffpath, t, l0, p0, NL, NP)
+    @printf("  loaded %d x %d, mean amp %.1f\n", NL, NP,
+        sum(abs, blk) / length(blk))
+    tR = s1_line_az_time(ann, l0 + NL ÷ 2)
+
+    # --- measured TOPS steering rate (iterated to convergence) ------------
+    # The scene-ramp slope = K_true * beta (beam-center sweep rate beta ~0.97),
+    # so iterating  rate <- rate + residual  converges to K_true in ~2 steps.
+    K0, K1 = measure_tops_rate(blk, ann, l0, p0)
+    ka_mid = s1_ka(ann, tR, (p0 + p1) ÷ 2)
+    @printf("  steering rate pass 1: K = %+.1f Hz/s (dK/dpx %+.2e)\n", K0, K1)
+    rate(t, px) = K0 + K1 * (px - p0)
+    b = copy(blk)
+    converged = false
+    for it in 1:3
+        tops_ramp!(b, ann, l0, p0, tR, -1, rate)
+        Kr, _ = measure_tops_rate(b, ann, l0, p0)
+        @printf("  pass %d: residual scene ramp %+8.2f Hz/s", it + 1, Kr)
+        if abs(Kr) < 2.0
+            println("  (converged)")
+            converged = true
+            break
+        end
+        # undo deramp, add correction (beta ~ 0.97 absorbed by iteration)
+        tops_ramp!(b, ann, l0, p0, tR, +1, rate)
+        K0 += Kr
+        rate(t, px) = K0 + K1 * (px - p0)
+        println()
+    end
+    @printf("  final steering rate K = %+.1f Hz/s | annotation k_a = %+.1f Hz/s (K/k_a = %.3f)\n",
+        K0, ka_mid, K0 / ka_mid)
+    @printf("  annotation PRF = %.4f Hz (candidate: K = PRF)\n", ann.prf)
+    converged || tops_ramp!(b, ann, l0, p0, tR, -1, rate)  # ensure deramped
+
+    # --- spectrum before / after ------------------------------------------
+    s_raw = block_spectrum_stats(blk, ann.azimuth_dt)
+    s_der = block_spectrum_stats(b, ann.azimuth_dt)
+    @printf("  spectrum raw    : centroid %+7.1f Hz  occ20 %.3f  occ80 %.3f  peak/mean %.1f\n",
+        s_raw.cent, s_raw.occ20, s_raw.occ80, s_raw.peak)
+    @printf("  spectrum deramp: centroid %+7.1f Hz  occ20 %.3f  occ80 %.3f  peak/mean %.1f\n",
+        s_der.cent, s_der.occ20, s_der.occ80, s_der.peak)
+
+    # --- deramp -> shift -> reramp -> back roundtrip ------------------------
+    delta = 3.4
+    b2 = copy(blk)
+    tops_ramp!(b2, ann, l0, p0, tR, -1, rate)
+    azimuth_shift!(b2, delta, ann.azimuth_dt)
+    tops_ramp!(b2, ann, l0, p0, tR + delta * ann.azimuth_dt, +1, rate)
+    a2 = abs.(b2); a0 = abs.(blk)
+    best = (-1.0, 0)
+    for lag in 0:7
+        cc = 0.0
+        for i in 1:(NL - 8), j in 1:NP
+            cc += a2[i + lag, j] * a0[i, j]
+        end
+        if cc > best[1]; best = (cc, lag); end
+    end
+    @printf("  shift integrity: best amplitude lag %d (delta was %.1f)\n",
+        best[2], delta)
+    tops_ramp!(b2, ann, l0, p0, tR + delta * ann.azimuth_dt, -1, rate)
+    azimuth_shift!(b2, -delta, ann.azimuth_dt)
+    tops_ramp!(b2, ann, l0, p0, tR, +1, rate)
+    # block roundtrip: window truncation leaves 1/d Gibbs ripples near edges
+    trim = 64
+    bi = (trim + 1):(NL - trim)
+    d = maximum(abs.(b2[bi, :] .- blk[bi, :])) / maximum(abs.(b2))
+    @printf("  block roundtrip (trim %d): max |diff|/max = %.2e (window-truncation limited)\n",
+        trim, d)
+    # exact roundtrip keeping the full FFT circle between shifts
+    n2c = nextpow(2, NL)
+    errmax = 0.0
+    for jj in range(1, NP, step = max(1, NP ÷ 40))
+        x = Vector{ComplexF32}(undef, n2c); fill!(x, 0.0f0 + 0.0f0im)
+        x[1:NL] .= @view blk[:, jj]
         y = azimuth_shift_vec(x, delta)
         y = azimuth_shift_vec(y, -delta)
         errmax = max(errmax, maximum(abs.(y[9:NL-8] .- x[9:NL-8])))
@@ -3151,6 +3491,513 @@ end
 function json_pairs(s::AbstractString)::Vector{Tuple{Float64,Float64}}
     out = Tuple{Float64,Float64}[]
     for m in eachmatch(r"(-?\d+\.?\d*),(-?\d+\.?\d*)", s)
+        push!(out, (parse(Float64, m[1]), parse(Float64, m[2])))
+    end
+    return out
+end
+
+"""All SENTINEL1 IW SLC products of a UTC day window whose footprint contains
+(lat, lon). Returns (name, t_start, t_stop) tuples, name without .SAFE."""
+function odata_find_day(t0::String, t1::String, lat::Float64, lon::Float64)
+    q = "https://catalogue.dataspace.copernicus.eu/odata/v1/Products" *
+        "?\$top=1000&\$filter=Collection/Name%20eq%20%27SENTINEL-1%27" *
+        "%20and%20contains(Name,%27_IW_SLC__1SDV%27)" *
+        "%20and%20ContentDate/Start%20ge%20" * t0 *
+        "%20and%20ContentDate/Start%20le%20" * t1
+    rc, code, _, body = http_get(q; timeout_s = 90)
+    (rc != 0 || code != 200) && error("OData query failed (rc=$rc code=$code)")
+    txt = String(body)
+    out = Tuple{String,Float64,Float64}[]
+    idxs = [m.offset for m in eachmatch(r"\"Name\":\"(S1[AB]_IW_SLC[^\"]+)\"", txt)]
+    for k in eachindex(idxs)
+        o = idxs[k]
+        nm = match(r"\"Name\":\"(S1[AB]_IW_SLC[^\"]+)\"", txt[o:end])[1]
+        endo = k < length(idxs) ? idxs[k + 1] : lastindex(txt)
+        seg = txt[o:endo-1]
+        cm = match(r"\"ContentDate\":\{\"Start\":\"([^\"]+)\",\"End\":\"([^\"]+)\"", seg)
+        cm === nothing && continue
+        arr = json_coord_array(seg)
+        arr === nothing && continue
+        coords = json_pairs(arr)
+        (length(coords) >= 3 && point_in_poly(coords, lon, lat)) || continue
+        endswith(nm, ".SAFE") && (nm = nm[1:end-5])
+        push!(out, (String(nm), parse_s1_time(cm[1]), parse_s1_time(cm[2])))
+    end
+    return out
+end
+
+"""All catalogue candidates within +/- dtol days of the target date whose
+footprint contains the point. Returns (name, t_start) tuples."""
+function odata_candidates(date::String, lat::Float64, lon::Float64;
+                          dtol::Int = 1)
+    y, m, d = parse.(Int, split(date, "-"))
+    base = Dates.Date(y, m, d)
+    out = Vector{Tuple{String,Float64}}()
+    seen = Set{String}()
+    for off in 0:dtol
+        for s in (off == 0 ? (0,) : (-off, off))
+            day = Dates.format(base + Dates.Day(s), "yyyy-mm-dd")
+            for (nm, t, _) in odata_find_day(day * "T00:00:00.000Z",
+                                             day * "T23:59:59.999Z", lat, lon)
+                if !(nm in seen)
+                    push!(seen, nm)
+                    push!(out, (nm, t))
+                end
+            end
+        end
+    end
+    return out
+end
+
+"""Circular distance of a time offset to a multiple of 24 h (seconds)."""
+tod_dist(t::Float64) = abs(mod(t, 86400.0) - (mod(t, 86400.0) > 43200 ? 86400.0 : 0.0))
+
+"""Pick the candidate whose start is closest to date@12:00 UTC. If tod_ref is
+given, restrict to products whose start time-of-day matches tod_ref within
+45 min (same track + pass => nearly identical UTC time)."""
+function odata_pick(cands::Vector{Tuple{String,Float64}}, date::String;
+                     tod_ref::Union{Nothing,Float64} = nothing)
+    isempty(cands) && error("no catalogue candidates near ", date)
+    y, m, d = parse.(Int, split(date, "-"))
+    tref = Dates.datetime2unix(Dates.DateTime(y, m, d, 12, 0, 0))
+    pool = cands
+    if tod_ref !== nothing
+        pool = [c for c in cands if tod_dist(c[2] - tod_ref) < 45 * 60]
+        isempty(pool) && return ("", 0.0)
+    end
+    return pool[argmin([abs(c[2] - tref) for c in pool])]
+end
+
+# ---- ASF range ZIP download --------------------------------------------------
+"""Bearer token: EARTHDATA_TOKEN env var, else earthdata.env next to the
+script or in the CWD.  NEVER print the token."""
+function earthdata_token()::String
+    tok = get(ENV, "EARTHDATA_TOKEN", "")
+    if isempty(tok)
+        for p in (joinpath(dirname(abspath(PROGRAM_FILE)), "earthdata.env"),
+                  "earthdata.env")
+            if isfile(p)
+                for line in eachline(p)
+                    s = strip(line)
+                    startswith(s, "EARTHDATA_TOKEN=") &&
+                        return String(split(s, "="; limit = 2)[2])
+                end
+            end
+        end
+    end
+    isempty(tok) && error("no Earthdata token: set EARTHDATA_TOKEN or " *
+                           "provide earthdata.env (EARTHDATA_TOKEN=...)")
+    return tok
+end
+
+"""Resolve an ASF product to (presigned_url, zip_size). Hop 1: bearer token
+request -> 303 + Location (a GET-signed presigned URL that supports Range);
+hop 2: probe Range 0-0 -> 206, total size from Content-Range."""
+function asf_presigned(prodname::String, tok::String)::Tuple{String,Int}
+    u1 = "https://sentinel1.asf.alaska.edu/SLC/SA/" * prodname * ".zip"
+    rc, code, head, _ = http_get(u1, ["Authorization: Bearer " * tok];
+                                rng = "0-0", timeout_s = 60)
+    loc = http_location(head)
+    lhost = isempty(loc) ? "" :
+            (m = match(r"https?://[^/]+", loc); m === nothing ? "?" : m.match)
+    prox = !isempty(get(ENV, "https_proxy", "")) ||
+           !isempty(get(ENV, "HTTPS_PROXY", ""))
+    diag = "toklen=$(length(tok))" * (prox ? ", proxy env SET" : "")
+    # accept any redirect (303 on HTTP/2, 302 seen on Windows/HTTP/1.1);
+    # the Location is the presigned CloudFront URL either way
+    if code in (301, 302, 303, 307, 308) && !isempty(loc)
+        occursin("urs.earthdata.nasa.gov", loc) &&
+            error("ASF saw NO valid Authorization header (redirect to " *
+                  "Earthdata login, $code; $diag). Either earthdata.env " *
+                  "is corrupted (token must be ONE line, no spaces or " *
+                  "backslashes; a valid edl-jwt is 690 chars) or something " *
+                  "on this machine/network strips the header (AV, TLS-" *
+                  "intercepting proxy).")
+        rc2, code2, head2, _ = http_get(loc; rng = "0-0", timeout_s = 60)
+        (rc2 == 0 && code2 == 206) ||
+            error("presigned probe failed (rc=$rc2 code=$code2, host=$lhost, $diag)")
+        m = match(r"content-range:\s*bytes\s+(\d+)-(\d+)/(\d+)", lowercase(head2))
+        m === nothing && error("no Content-Range on presigned probe")
+        return (loc, parse(Int, m[3]))
+    elseif code == 200
+        # direct hit (no redirect): size from Content-Length
+        m = match(r"content-length:\s*(\d+)", lowercase(head))
+        m === nothing && error("200 without Content-Length")
+        return (u1, parse(Int, m[1]))
+    end
+    error("ASF resolve failed (rc=$rc code=$code" *
+          (isempty(lhost) ? "" : ", location host: " * lhost) *
+          "; $diag)")
+end
+
+struct ZipMember
+    name::String
+    method::Int
+    crc::UInt32
+    csz::Int
+    usz::Int
+    lho::Int
+end
+
+"""Read the ZIP end-of-central-directory over HTTP ranges and parse the
+central directory. Returns the member list."""
+function zip_central_dir(loc::String, zsize::Int)::Vector{ZipMember}
+    t0 = max(0, zsize - 65536)
+    rc, code, _, tail = http_get(loc; rng = string(t0) * "-" * string(zsize - 1),
+                                 timeout_s = 90)
+    (rc == 0 && code == 206) || error("zip tail fetch failed (rc=$rc code=$code)")
+    eocd = 0
+    for i in length(tail) - 21:-1:1
+        if tail[i] == 0x50 && tail[i+1] == 0x4b && tail[i+2] == 0x05 && tail[i+3] == 0x06
+            eocd = i
+            break
+        end
+    end
+    eocd == 0 && error("EOCD signature not found in zip tail")
+    nmem = Int(reinterpret(UInt16, tail[eocd+10:eocd+11])[1])
+    cdsize = Int(reinterpret(UInt32, tail[eocd+12:eocd+15])[1])
+    cdoff = Int(reinterpret(UInt32, tail[eocd+16:eocd+19])[1])
+    (nmem == 0 || cdsize == 0) && error("EOCD parse garbage (nmem=$nmem)")
+    if cdoff >= t0
+        cd = tail[cdoff - t0 + 1:cdoff - t0 + cdsize]
+    else
+        rc2, code2, _, cd = http_get(loc; rng = string(cdoff) * "-" *
+                                                string(cdoff + cdsize - 1),
+                                     timeout_s = 90)
+        (rc2 == 0 && code2 == 206 && length(cd) == cdsize) ||
+            error("central directory fetch failed")
+    end
+    members = ZipMember[]
+    p = 1
+    while p + 46 <= length(cd) + 1 && reinterpret(UInt32, cd[p:p+3])[1] == 0x02014b50
+        meth = Int(reinterpret(UInt16, cd[p+10:p+11])[1])
+        crc = reinterpret(UInt32, cd[p+16:p+19])[1]
+        csz = Int(reinterpret(UInt32, cd[p+20:p+23])[1])
+        usz = Int(reinterpret(UInt32, cd[p+24:p+27])[1])
+        nlen = Int(reinterpret(UInt16, cd[p+28:p+29])[1])
+        elen = Int(reinterpret(UInt16, cd[p+30:p+31])[1])
+        clen = Int(reinterpret(UInt16, cd[p+32:p+33])[1])
+        lho = Int(reinterpret(UInt32, cd[p+42:p+45])[1])
+        nm = String(cd[p+46:p+45+nlen])
+        push!(members, ZipMember(nm, meth, crc, csz, usz, lho))
+        p += 46 + nlen + elen + clen
+    end
+    length(members) == nmem ||
+        println("  zip: parsed ", length(members), " of ", nmem, " members (odd)")
+    return members
+end
+
+"""Fetch one byte range with retries; re-resolves the presigned URL on
+transport errors or 403 (expired signature)."""
+function zip_range!(loc::Vector{String}, tok::String, prodname::String,
+                    a::Int, b::Int; timeout_s::Int = 180)::Vector{UInt8}
+    for attempt in 1:6
+        rc, code, _, body = http_get(loc[1]; rng = string(a) * "-" * string(b),
+                                     timeout_s = timeout_s)
+        if rc == 0 && code == 206 && length(body) == b - a + 1
+            return body
+        end
+        if code == 403 || rc != 0
+            println("  http retry (rc=$rc code=$code attempt=$attempt): ",
+                    "re-resolving presigned URL")
+            loc[1], _ = asf_presigned(prodname, tok)
+            sleep(2)
+        else
+            sleep(2)
+        end
+    end
+    error("range fetch failed for bytes $a-$b")
+end
+
+"""Download and extract one ZIP member (local header walk + chunked range
+fetch + raw-DEFLATE inflate or stored copy) with CRC32 verification."""
+function zip_fetch_member(loc::Vector{String}, tok::String, prodname::String,
+                          mem::ZipMember, outpath::String;
+                          chunk::Int = 16 * 2^20, quiet::Bool = false)
+    # local file header: fixed 30 B + name + extra
+    lh = zip_range!(loc, tok, prodname, mem.lho, mem.lho + 29)
+    (reinterpret(UInt32, lh[1:4])[1] == 0x04034b50) ||
+        error("local header signature mismatch")
+    nlen = Int(reinterpret(UInt16, lh[27:28])[1])
+    elen = Int(reinterpret(UInt16, lh[29:30])[1])
+    dstart = mem.lho + 30 + nlen + elen
+    comp = Vector{UInt8}()
+    sizehint!(comp, mem.csz)
+    done = 0
+    while done < mem.csz
+        b = min(done + chunk, mem.csz) - 1
+        append!(comp, zip_range!(loc, tok, prodname, dstart + done, dstart + b))
+        done = b + 1
+        quiet || @printf("    %6.1f / %6.1f MB\r", done / 2^20, mem.csz / 2^20)
+    end
+    if mem.method == 8
+        inflate_to_file(comp, outpath)
+    elseif mem.method == 0
+        open(outpath, "w") do io
+            write(io, comp)
+        end
+    else
+        error("unsupported zip method ", mem.method)
+    end
+    filesize(outpath) == mem.usz ||
+        error("size mismatch after inflate ($(filesize(outpath)) vs $(mem.usz))")
+    got = crc32_file(outpath)
+    got == mem.crc ||
+        error(@sprintf("CRC32 mismatch for %s: %08x != %08x",
+                       basename(outpath), got, mem.crc))
+end
+
+"""Download iw2-vv measurement TIFF + annotation XML of an ASF S1 SLC
+product into datadir, reusing files already present (naming convention
+asf<disc>_iw2_vv.tiff / <disc>_iw2_vv.xml). Verifies CRC32 from the zip
+central directory and MD5 from manifest.safe. Returns (tiff, xml)."""
+function s1_pair_download(prodname::String, datadir::String, tok::String)
+    disc = split(prodname, "_")[end]
+    tiff = joinpath(datadir, "asf" * disc * "_iw2_vv.tiff")
+    xml = joinpath(datadir, disc * "_iw2_vv.xml")
+    if isfile(tiff) && isfile(xml)
+        println("  ", disc, ": iw2-vv pair already cached, reusing")
+        return (tiff, xml)
+    end
+    mkpath(datadir)
+    println("  ", disc, ": resolving ASF presigned URL...")
+    loc, zsize = asf_presigned(prodname, tok)
+    @printf("  %s: zip %.2f GB, reading central directory...\n", disc, zsize / 2^30)
+    members = zip_central_dir(loc, zsize)
+    locv = [loc]
+    annm = nothing; tifm = nothing; manm = nothing
+    for m in members
+        occursin("/annotation/", m.name) && occursin("iw2-slc-vv", m.name) &&
+            (annm = m)
+        occursin("/measurement/", m.name) && occursin("iw2-slc-vv", m.name) &&
+            (tifm = m)
+        endswith(m.name, "manifest.safe") && (manm = m)
+    end
+    tifm === nothing && error("no iw2-vv measurement member in zip")
+    annm === nothing && error("no iw2-vv annotation member in zip")
+    @printf("  %s: annotation %d B, tiff %.1f MB (compressed)\n",
+            disc, annm.usz, tifm.csz / 2^20)
+    println("  ", disc, ": fetching annotation...")
+    zip_fetch_member(locv, tok, prodname, annm, xml)
+    md5map = Dict{String,String}()
+    if manm !== nothing
+        mp = xml * ".manifest.tmp"
+        try
+            zip_fetch_member(locv, tok, prodname, manm, mp; quiet = true)
+            man = read(mp, String)
+            # <dataObject ...><byteStream ...><fileLocation href="..."> +
+            # <checksum checksumName="MD5">hex</checksum> (multiline blocks)
+            for dm in eachmatch(
+                    r"<dataObject [^>]*>.*?</dataObject>"s, man)
+                seg = dm.match
+                hm = match(r"checksumName=\"MD5\">\s*([0-9a-fA-F]{32})", seg)
+                fm = match(r"href=\"([^\"]+)\"", seg)
+                if hm !== nothing && fm !== nothing
+                    md5map[basename(fm[1])] = lowercase(hm[1])
+                end
+            end
+            rm(mp)
+        catch e
+            println("  warning: manifest.safe MD5 check skipped (", e, ")")
+        end
+    end
+    @printf("  %s: fetching tiff (%.0f MB compressed, chunked)...\n",
+            disc, tifm.csz / 2^20)
+    t0 = time()
+    zip_fetch_member(locv, tok, prodname, tifm, tiff)
+    dt = time() - t0
+    @printf("  %s: tiff done in %.0f s (%.1f MB/s net)\n",
+            disc, dt, tifm.csz / 2^20 / max(dt, 0.1))
+    md5got = md5_file(tiff)
+    println("  ", disc, ": tiff MD5 ", md5got)
+    md5ok = false
+    for (fn, md5) in md5map
+        if endswith(fn, ".tiff") && occursin("iw2-slc-vv", fn)
+            if lowercase(md5) == md5got
+                md5ok = true
+                println("  ", disc, ": MD5 matches manifest.safe ✓")
+            else
+                error("MD5 mismatch vs manifest.safe: $md5got != $md5")
+            end
+        end
+    end
+    md5ok || println("  ", disc, ": (no manifest MD5 entry found; CRC32 verified)")
+    return (tiff, xml)
+end
+
+# ---- automatic block choice --------------------------------------------------
+"""RD-solve the target in the primary: returns (burst k with the target most
+central in its steering window, target line, target pixel)."""
+function s1_target_burst(ann::S1Annotation, lat::Float64, lon::Float64;
+                         h::Float64 = 50.0)
+    t_rd, r = s1_rd_time(ann, lat, lon, h)
+    LPB = ann.lines_per_burst
+    wS = LPB * ann.azimuth_dt
+    bestk = -1; bestd = Inf
+    for k in 0:length(ann.bursts) - 1
+        u = t_rd - ann.bursts[k + 1].t_az
+        (u < 0 || u >= wS) && continue
+        d = abs(u - wS / 2)
+        d < bestd && (bestd = d; bestk = k)
+    end
+    bestk < 0 && error("target outside the primary burst windows")
+    line = bestk * LPB + (t_rd - ann.bursts[bestk + 1].t_az) / ann.azimuth_dt
+    px = (2 * r / S1_C - ann.slant_t0) * ann.range_sr
+    return bestk, line, px
+end
+
+"""Choose the interferogram block around the target, clear of burst seams in
+BOTH images (secondary seams sit at j*LPB - dline in primary lines). Returns
+(burst, l0, l1, p0, p1); shrinks the azimuth size in steps of 100 (min 200)
+if no seam-free placement exists."""
+function pair_auto_block(annP::S1Annotation, annS::S1Annotation, dline::Float64,
+                        k::Int, line_rd::Float64, px_rd::Float64,
+                        NL0::Int, NP::Int)
+    LPB = annP.lines_per_burst
+    marg = 40
+    NL = NL0
+    l0 = 0
+    while true
+        lo_min = max(k * LPB + marg, 1)
+        lo_max = min((k + 1) * LPB - marg - NL + 1, annP.nlines - NL + 1,
+                     round(Int, annS.nlines - dline) - NL + 1)
+        if lo_max < lo_min
+            NL <= 200 && error("block does not fit burst $k (NL=$NL)")
+            NL -= 100
+            continue
+        end
+        # secondary seams inside this burst (primary coordinates)
+        seams = Float64[]
+        for j in 0:length(annS.bursts) - 1
+            ss = j * annS.lines_per_burst - dline
+            (ss > k * LPB && ss < (k + 1) * LPB) && push!(seams, ss)
+        end
+        lc = clamp(round(Int, line_rd - NL / 2), lo_min, lo_max)
+        l0 = lc
+        ok = true
+        for _ in 1:10                          # re-stabilise over all seams
+            ok = true
+            for ss in seams
+                if l0 - marg <= ss <= l0 + NL - 1 + marg
+                    left_l0 = floor(Int, ss) - marg - NL + 1
+                    right_l0 = ceil(Int, ss) + marg
+                    left_ok = left_l0 >= lo_min
+                    right_ok = right_l0 + NL - 1 <= lo_max
+                    if left_ok && right_ok
+                        l0 = abs(left_l0 - lc) <= abs(right_l0 - lc) ?
+                             left_l0 : right_l0
+                    elseif left_ok
+                        l0 = left_l0
+                    elseif right_ok
+                        l0 = right_l0
+                    else
+                        ok = false
+                        break
+                    end
+                end
+            end
+            ok && break
+        end
+        ok && break
+        NL <= 200 && error("no seam-free block of NL=$NL in burst $k")
+        NL -= 100
+    end
+    l1 = l0 + NL - 1
+    # pixel window: stay inside the burst's valid samples
+    fv = -1; lv = typemax(Int)
+    for l in l0:l1
+        li = l - k * LPB
+        (li < 0 || li >= length(annP.bursts[k + 1].first_valid)) && continue
+        a = annP.bursts[k + 1].first_valid[li + 1]
+        b = annP.bursts[k + 1].last_valid[li + 1]
+        a >= 0 && (fv = max(fv, a); lv = min(lv, b))
+    end
+    fv < 0 && (fv = 0; lv = annP.nsamples - 1)
+    p0 = clamp(round(Int, px_rd - NP / 2), fv + marg, lv - marg - NP + 1)
+    (p0 + NP - 1 > lv - marg || p0 < fv + marg) &&
+        error("pixel window $NP too wide for valid samples [$fv, $lv]")
+    return k, l0, l1, p0, p0 + NP - 1
+end
+
+# ---- the pair driver ---------------------------------------------------------
+"""raw pair: catalogue search + ASF download + auto block + interferogram.
+Options: --lat --lon --date --date2 [--dtol N] [--pass auto|desc|asc]
+[--topo] [--nlines N] [--npix N] [--coh C] [--datadir DIR]
+[--vname NAME]  (with --topo: native Vedurstofa-style LOS map BMP)"""
+function raw_pair_driver(opts::Dict{String,String}, outdir::String)
+    lat = num(opts, "lat", NaN)
+    lon = num(opts, "lon", NaN)
+    (isnan(lat) || isnan(lon)) && error("raw pair needs --lat and --lon")
+    d1 = get(opts, "date", "")
+    d2 = get(opts, "date2", "")
+    (isempty(d1) || isempty(d2)) &&
+        error("raw pair needs --date YYYY-MM-DD and --date2 YYYY-MM-DD")
+    dtol = Int(num(opts, "dtol", 1.0))
+    passwant = get(opts, "pass", "auto")
+    NL0 = Int(num(opts, "nlines", 700.0))
+    NP = Int(num(opts, "npix", 2200.0))
+    datadir = get(opts, "datadir", "data")
+    tok = earthdata_token()
+    @printf("pair driver: target %.4f, %.4f  dates %s -> %s (tol %d d)\n",
+            lat, lon, d1, d2, dtol)
+    println("catalogue: CDSE OData search (footprint point-in-polygon)...")
+    c1 = odata_candidates(d1, lat, lon; dtol = dtol)
+    c2 = odata_candidates(d2, lat, lon; dtol = dtol)
+    p1name, p1t = odata_pick(c1, d1)
+    @printf("primary   : %s  (start %s)\n", p1name,
+            Dates.format(Dates.unix2datetime(p1t), "yyyy-mm-dd HH:MM:SS"))
+    # secondary: same track + pass => nearly identical UTC start time
+    s2name, s2t = odata_pick(c2, d2; tod_ref = p1t)
+    if s2name == ""
+        error("no same-time-of-day product near ", d2,
+              " (different track/pass); try other dates or --lat/--lon")
+    end
+    @printf("secondary : %s  (start %s)\n", s2name,
+            Dates.format(Dates.unix2datetime(s2t), "yyyy-mm-dd HH:MM:SS"))
+    dt = s2t - p1t
+    @printf("pair dt   : %.3f d\n", dt / 86400)
+    println("download: ASF range-ZIP (Earthdata bearer), iw2-vv...")
+    tiff1, xml1 = s1_pair_download(p1name, datadir, tok)
+    tiff2, xml2 = s1_pair_download(s2name, datadir, tok)
+    A1 = parse_s1_annotation(xml1)
+    A2 = parse_s1_annotation(xml2)
+    if passwant in ("desc", "asc")
+        A1.pass_dir == passwant || error("primary pass is $(A1.pass_dir), wanted $passwant")
+        A2.pass_dir == passwant || error("secondary pass is $(A2.pass_dir), wanted $passwant")
+    end
+    println("annotations: primary $(A1.pass_dir) $(A1.mission), ",
+            "secondary $(A2.pass_dir) $(A2.mission), ",
+            "LPB $(A1.lines_per_burst)")
+    k, line_rd, px_rd = s1_target_burst(A1, lat, lon)
+    @printf("target RD : burst %d, line %.1f, px %.1f\n", k, line_rd, px_rd)
+    dl, dp, dtp = coreg_shift_gcps(A1, A2, k)
+    isempty(dl) && error("no coreg GCPs at burst $k (wrong slice?)")
+    dline = sum(dl) / length(dl)
+    @printf("coreg     : dline %+.2f +- %.2f (%d GCPs)\n",
+            dline, sqrt(sum(abs2, dl .- dline) / length(dl)), length(dl))
+    kk, l0, l1, p0, p1 = pair_auto_block(A1, A2, dline, k, line_rd, px_rd, NL0, NP)
+    @printf("auto block: burst %d, lines %d..%d (%d), px %d..%d (%d)\n",
+            kk, l0, l1, l1 - l0 + 1, p0, p1, p1 - p0 + 1)
+    println("running interferogram pipeline (raw ifg)...")
+    raw_ifg(A1, tiff1, read_slc_tiff(tiff1);
+            annS = A2, tiffS_path = tiff2,
+            burst = kk, l0 = l0, l1 = l1, p0 = p0, p1 = p1,
+            topo = haskey(opts, "topo"),
+            cohthr = num(opts, "coh", 0.15),
+            vlat = lat, vlon = lon,
+            vname = get(opts, "vname", "Geldingadalur"),
+            mtitle = "LOS deformation (" * replace(d1, "-" => "") * "-" *
+                     replace(d2, "-" => "") * ")",
+            outdir = outdir)
+    println("pair complete.")
+end
+
+# ----------------------------------------------------------------------------
+# 8. Natural-colour satellite rendering
+# ----------------------------------------------------------------------------
+
+function render_satellite(dem::Matrix{Float64}, px::Float64, seed::Int,
+                          style::TerrainStyle; clouds::Bool = true,
                           relief::Float64 = 1900.0)
     H, W = size(dem)
     sh, sl = hillshade(dem, px)
@@ -4697,3 +5544,271 @@ function main()
         elseif sub == "ifg"
             T === nothing && error("raw ifg needs --tiff <slc measurement>")
             ann2p = get(opts, "ann2", "")
+            tiff2p = get(opts, "tiff2", tp)
+            A2 = isempty(ann2p) ? nothing : parse_s1_annotation(ann2p)
+            T2 = isempty(tiff2p) ? nothing : read_slc_tiff(tiff2p)
+            raw_ifg(A, tp, T;
+                annS = A2, tiffS_path = tiff2p, tS = T2,
+                burst = Int(num(opts, "burst", -1.0)),
+                l0 = Int(num(opts, "l0", -1.0)),
+                l1 = Int(num(opts, "l1", -1.0)),
+                p0 = Int(num(opts, "p0", 14000.0)),
+                p1 = Int(num(opts, "p1", 18000.0)),
+                mla = Int(num(opts, "mla", 8.0)),
+                mlr = Int(num(opts, "mlr", 4.0)),
+                sim = haskey(opts, "sim"),
+                simmax_cm = num(opts, "simmax", 6.0),
+                test_dline = num(opts, "tdl", 0.0),
+                test_dpx = num(opts, "tdp", 0.0),
+                topo = haskey(opts, "topo"),
+                cohthr = num(opts, "coh", 0.15),
+                vlat = num(opts, "vlat", NaN),
+                vlon = num(opts, "vlon", NaN),
+                vname = get(opts, "vname", "Geldingadalur"),
+                mtitle = get(opts, "mtitle", "LOS deformation"),
+                outdir = outdir)
+        elseif sub == "dem"
+            T === nothing && error("raw dem needs --tiff <slc measurement>")
+            raw_dem(A, tp, T;
+                burst = Int(num(opts, "burst", -1.0)),
+                l0 = Int(num(opts, "l0", -1.0)),
+                l1 = Int(num(opts, "l1", -1.0)),
+                p0 = Int(num(opts, "p0", 14000.0)),
+                p1 = Int(num(opts, "p1", 18000.0)),
+                mla = Int(num(opts, "mla", 8.0)),
+                mlr = Int(num(opts, "mlr", 4.0)),
+                stride = Int(num(opts, "stride", 4.0)),
+                outdir = outdir)
+        else
+            println("raw: unknown subcommand '", sub, "' (info | selftest | ifg | dem)")
+        end
+        println("done.")
+        return
+    end
+
+    # -------------------------------------------------- real InSAR (LiCSAR) --
+    if cmd == "real"
+        scene = nothing
+        if place != ""
+            for sc in LICSAR_SCENES
+                sc.place == place && (scene = sc)
+            end
+            scene === nothing && error("no real-InSAR scene for place '", place,
+                "' -- available: ", join([sc.place for sc in LICSAR_SCENES], ", "))
+        elseif haskey(opts, "frameset")
+            fs = get(opts, "frameset", "")
+            isempty(fs) && error("--frameset needs a LiCSAR frameset ID")
+            isempty(get(opts, "pair", "")) &&
+                error("--frameset also needs --pair YYYYMMDD_YYYYMMDD")
+            scene = LiCSScene(fs, lics_trackdir(fs), -180.0, 180.0, -90.0, 90.0,
+                              get(opts, "pair", ""), (NaN, NaN), "",
+                              "custom frameset " * fs)
+        else
+            scene = LICSAR_SCENES[1]
+        end
+        pair = get(opts, "pair", scene.pair)
+        latC, lonC = scene.site
+        haskey(opts, "lat") && (latC = num(opts, "lat", latC))
+        haskey(opts, "lon") && (lonC = num(opts, "lon", lonC))
+        label = get(opts, "label", "")
+        isempty(label) && (label = isempty(scene.place) ? scene.frameset : scene.place)
+        cache = joinpath(outdir, "licsar_" * scene.frameset)
+        mkpath(cache)
+        println("  scene: ", scene.desc)
+        println("  frameset ", scene.frameset, ", pair ", pair,
+                " (COMET LiCSAR archive via CEDA, cached in ", cache, ")")
+        phaf = joinpath(cache, pair * ".geo.diff_pha.tif")
+        ccf  = joinpath(cache, pair * ".geo.cc.tif")
+        lics_download(lics_url(scene, pair, "diff_pha.tif"), phaf)
+        lics_download(lics_url(scene, pair, "cc.tif"), ccf)
+        pha_head = tiff_head(phaf)
+        cc_head = tiff_head(ccf)
+        (pha_head.W == cc_head.W && pha_head.H == cc_head.H) ||
+            error("phase / coherence grid mismatch")
+        pha_head.geo === nothing && error("interferogram has no geo tags")
+        geo = pha_head.geo
+        W, H = pha_head.W, pha_head.H
+        if haskey(opts, "full")
+            y0, y1, x0, x1 = 1, H, 1, W
+        else
+            half = num(opts, "crop", 0.2)
+            half > 0 || error("--crop must be > 0")
+            isnan(latC) && error("--lat/--lon needed to centre the crop")
+            halflon = half / max(cosd(latC), 0.05)
+            y0 = max(1, Int(floor(1 + (geo.lat0 - (latC + half)) / (-geo.dlat))))
+            y1 = min(H, Int(ceil(1 + (geo.lat0 - (latC - half)) / (-geo.dlat))))
+            x0 = max(1, Int(floor(1 + (lonC - halflon - geo.lon0) / geo.dlon)))
+            x1 = min(W, Int(ceil(1 + (lonC + halflon - geo.lon0) / geo.dlon)))
+            (y1 >= y0 && x1 >= x0) || error("crop window outside the frame")
+        end
+        @printf("  frame %dx%d px, crop rows %d:%d cols %d:%d (%.2f-%.2f E, %.2f-%.2f N)\n",
+                W, H, y0, y1, x0, x1,
+                geo.lon0 + geo.dlon * (x0 - 1), geo.lon0 + geo.dlon * (x1 - 1),
+                geo.lat0 + geo.dlat * (y1 - 1), geo.lat0 + geo.dlat * (y0 - 1))
+        println("  decoding wrapped phase + coherence (pure-Julia inflate + GeoTIFF)...")
+        pha = tiff_read(phaf, y0, y1, x0, x1)
+        ccv = tiff_read(ccf, y0, y1, x0, x1)
+        coh = ccv ./ 255.0
+        pha .= wrapd.(pha)                    # defensive re-wrap into (-pi, pi]
+        any(isnan, pha) && println("  warning: NaN pixels in the phase (masked out)")
+        cohthr = num(opts, "coh", 0.15)
+        lam_cm = num(opts, "lambda", 5.55)
+        mask = (coh .>= cohthr) .& (.!isnan.(pha))
+        count(mask) == 0 && error("no coherent pixels -- lower the --coh threshold")
+        println("  unwrapping (quality-guided flood fill, coherence-ordered)...")
+        unw = unwrap_quality(pha, coh, mask)
+        frac = count(!isnan, unw) / count(mask)
+        @printf("  unwrapped %d / %d coherent px (%.1f %%)\n",
+                count(!isnan, unw), count(mask), 100frac)
+        frac < 0.02 && println("  warning: almost nothing unwrapped -- coherence threshold too high?")
+        img, imgc, imgd, dcm, stats = render_real_insar(pha, coh, unw, lam_cm, cohthr)
+        write_bmp(joinpath(outdir, "interferogram_real_" * label * ".bmp"), img)
+        write_bmp(joinpath(outdir, "coherence_real_" * label * ".bmp"), imgc)
+        write_bmp(joinpath(outdir, "unwrapped_real_" * label * ".bmp"), imgd)
+        Hc, Wc = size(pha)
+        cy = (Hc + 1) ÷ 2; cx = (Wc + 1) ÷ 2
+        dc = dcm[cy, cx]
+        @printf("  deformation: %.2f cm max |LOS| = %.1f fringes (relative to the most coherent reference px), mean coherence %.3f\n",
+                stats.max_cm, stats.max_cm / (lam_cm / 2), stats.mean_coh)
+        if isnan(dc)
+            println("  centre pixel not unwrapped (masked as incoherent)")
+        else
+            @printf("  LOS displacement at the crop centre: %+.2f cm (positive = toward satellite)\n",
+                    dc)
+        end
+        if haskey(opts, "unwref")
+            unwf = joinpath(cache, pair * ".geo.unw.tif")
+            lics_download(lics_url(scene, pair, "unw.tif"), unwf)
+            ref = tiff_read(unwf, y0, y1, x0, x1)
+            diffs = Float64[]
+            for k in eachindex(unw)
+                if !isnan(unw[k]) && !isnan(ref[k])
+                    push!(diffs, wrapd(unw[k] - ref[k]))
+                end
+            end
+            if length(diffs) > 100
+                s = sum(cos, diffs); t = sum(sin, diffs)
+                R = hypot(s, t) / length(diffs)
+                @printf("  check vs LiCSAR unwrapped: %d px agree up to a constant %.4f rad (concentration %.4f)\n",
+                        length(diffs), atan(t, s), R)
+                R > 0.999 && println("  -> our unwrapping reproduces the reference field")
+            else
+                println("  check vs LiCSAR unwrapped: too little overlap")
+            end
+        end
+        println("done.")
+        return
+    end
+
+    # ------------------------------------------------------------- terrain --
+    local dem::Matrix{Float64}
+    local style::TerrainStyle
+    local px::Float64
+    local prefix::String
+    local pi_info::Union{PlaceInfo,Nothing} = nothing
+    if place != ""
+        pi_info = PLACES[place]
+        style = pi_info.style
+        prefix = place
+        gH = clamp(Int(num(opts, "grid", 64.0)), 24, 140)
+        r = fetch_dem(pi_info, place, gH, outdir;
+                      fast = haskey(opts, "fast"),
+                      maxsec = num(opts, "maxsec", 0.0))
+        if r === nothing || r[1] === nothing
+            return
+        end
+        dem, gW = r
+        # render resolution: upscale so the larger side is ~ size (default 900)
+        rsize = Int(num(opts, "size", 900.0))
+        sc = max(1.0, rsize / max(gH, gW))
+        rH = round(Int, gH * sc); rW = round(Int, gW * sc)
+        dem = upsample(dem, rH, rW)
+        px = 111320.0 * (pi_info.lat2 - pi_info.lat1) / (rH - 1)
+        println("  real DEM upsampled to ", rW, "x", rH,
+                "  (", round(px, digits = 1), " m/px)")
+    else
+        rsize = clamp(Int(num(opts, "size", 900.0)), 128, 4000)
+        W = rsize; H = rsize
+        relief = num(opts, "relief", 1900.0)
+        waterfrac = num(opts, "waterfrac", 0.30)
+        println("  generating synthetic terrain ", W, "x", H,
+                " (seed ", seed, ", relief ", relief, " m)...")
+        dem = synthetic_dem(W, H; seed = seed, relief = relief, waterfrac = waterfrac)
+        px = 22.0
+        style = TerrainStyle(1200.0, relief * 0.78, true, false, 0.0,
+                             (110.0, 102.0, 92.0), (52.0, 92.0, 48.0),
+                             (96.0, 84.0, 50.0))
+        prefix = "synthetic"
+    end
+    snl = num(opts, "snowline", -1.0)
+    if snl > 0
+        style = TerrainStyle(style.treeline, snl, style.sea, style.farmland,
+                             style.farmmax, style.rock, style.low, style.mid)
+    end
+
+    H, W = size(dem)
+    hmax = maximum(dem)
+    @printf("  elevation range: %.0f .. %.0f m\n", minimum(dem), hmax)
+
+    # ------------------------------------------------------------ products --
+    if cmd in ("demo", "terrain", "place")
+        println("  rendering satellite image...")
+        img, stats = render_satellite(dem, px, seed, style;
+                    clouds = clouds, relief = hmax)
+        write_bmp(joinpath(outdir, "satellite_" * prefix * ".bmp"), img)
+        if stats.npix > 0
+            @printf("  land %.1f %%  snow %.1f %%\n",
+                    100 * stats.land / stats.npix, 100 * stats.snow / stats.npix)
+        end
+    end
+    if cmd in ("demo", "sar")
+        println("  rendering SAR amplitude...")
+        img = render_sar(dem, px, seed, style)
+        write_bmp(joinpath(outdir, "sar_" * prefix * ".bmp"), img)
+    end
+    if cmd in ("demo", "insar", "place")
+        source = get(opts, "source", "mogi")
+        srcpars = Dict{String,Float64}(
+            "depth" => num(opts, "depth", place == "" ? 3500.0 : pi_info.depth),
+            "strike" => num(opts, "strike", 35.0),
+            "length" => num(opts, "length", 8000.0))
+        xf = num(opts, "x", 0.5); yf = num(opts, "y", 0.5)
+        local xc, yc
+        if place != "" && !haskey(opts, "x") && !haskey(opts, "y")
+            # default: source under the place's summit
+            xc = 1 + (pi_info.summit[2] - pi_info.lon1) /
+                 (pi_info.lon2 - pi_info.lon1) * (W - 1)
+            yc = 1 + (pi_info.lat2 - pi_info.summit[1]) /
+                 (pi_info.lat2 - pi_info.lat1) * (H - 1)
+        else
+            xc = 1 + xf * (W - 1); yc = 1 + yf * (H - 1)
+        end
+        cfg = (source = source, srcpars = srcpars, xc = xc, yc = yc,
+               cm = num(opts, "cm", 14.0),
+               heading = num(opts, "heading", 193.0),
+               inc = num(opts, "inc", 35.0),
+               lam_cm = num(opts, "lambda", 5.55),
+               bperp = num(opts, "bperp", 0.0),
+               demerr = num(opts, "demerr", 0.0),
+               atm = num(opts, "atm", 0.35),
+               coh = num(opts, "coh", 0.9),
+               range = 800e3)
+        println("  simulating interferogram: source=", source,
+                " depth=", round(Int, srcpars["depth"]), " m",
+                ", LOS max ", cfg.cm, " cm, lambda ", cfg.lam_cm, " cm,",
+                " heading ", round(Int, cfg.heading), " deg, inc ",
+                round(Int, cfg.inc), " deg")
+        img, img_c, img_u, stats = render_insar(dem, px, seed, style, cfg)
+        write_bmp(joinpath(outdir, "interferogram_" * prefix * ".bmp"), img)
+        write_bmp(joinpath(outdir, "coherence_" * prefix * ".bmp"), img_c)
+        write_bmp(joinpath(outdir, "unwrapped_" * prefix * ".bmp"), img_u)
+        @printf("  deformation: %.2f cm max LOS -> %.1f fringes, mean coherence %.2f\n",
+                stats.max_los_cm, stats.fringes, stats.mean_coh)
+    end
+    println("done.")
+end
+
+# run only as a script (allows `include` for testing without side effects)
+if abspath(PROGRAM_FILE) == @__FILE__
+    main()
+end
