@@ -5,19 +5,40 @@
 # Untested on Windows: if a gmt(...) call complains about redirection,
 # fall back to gmt_map.sh with the GMT binaries on PATH.
 #
-# Usage: julia gmt_map.jl [outdir] [label] [title]
-#   outdir  directory containing disp_<label>.xyz and dem_<label>.xyz
-#   label   pair label used by `raw ifg --out` (e.g. raw_b8)
+# Usage: julia gmt_map.jl [outdir] [label] [title] [vent_lon] [vent_lat] [vent_name]
+#   outdir   directory containing disp_<label>.xyz and dem_<label>.xyz
+#   label    pair label used by `raw pair --out` (e.g. raw_b8)
+#   title    map title
+#   vent     optional marker position (default: Geldingadalur -22.272 63.890)
+# Region and grid spacing are derived automatically from dem_<label>.xyz,
+# so the same script works for any crop size (small block or 1100x3900).
 using GMT
+using Printf
 
-out   = length(ARGS) >= 1 ? ARGS[1] : "data/ifg_out/sq"
-label = length(ARGS) >= 2 ? ARGS[2] : "raw_b8"
-title = length(ARGS) >= 3 ? ARGS[3] : "LOS deformation (20210307-20210319)"
+out    = length(ARGS) >= 1 ? ARGS[1] : "data/ifg_out/sq"
+label  = length(ARGS) >= 2 ? ARGS[2] : "raw_b8"
+title  = length(ARGS) >= 3 ? ARGS[3] : "LOS deformation (20210307-20210319)"
+vlon   = length(ARGS) >= 4 ? ARGS[4] : "-22.272"
+vlat   = length(ARGS) >= 5 ? ARGS[5] : "63.890"
+vname  = length(ARGS) >= 6 ? ARGS[6] : "Geldingadalur"
 
-# Region/incidence: 0.22 deg lon x 0.118 deg lat, 201x201 nodes (~55x65 m)
-R = "-R-22.39/-22.17/63.826/63.944"
-I = "-I0.0011/0.00059"
+# Region = dem extents, grid = 201x201 nodes (exact multiples for nearneighbor)
+w, e, s, n = Inf, -Inf, Inf, -Inf
+demfile = joinpath(out, "dem_$(label).xyz")
+for line in eachline(demfile)
+    c = split(line)
+    length(c) >= 2 || continue
+    lo = parse(Float64, c[1]); la = parse(Float64, c[2])
+    lo < w && (w = lo); lo > e && (e = lo)
+    la < s && (s = la); la > n && (n = la)
+end
+w = round(w, digits = 4); e = round(e, digits = 4)
+s = round(s, digits = 4); n = round(n, digits = 4)
+ix = (e - w) / 200; iy = (n - s) / 200
+R = @sprintf("-R%.4f/%.4f/%.4f/%.4f", w, e, s, n)
+I = @sprintf("-I%.10g/%.10g", ix, iy)
 J = "-JM14c"
+@printf("region %s  grid %s\n", R, I)
 
 cd(out) do
     # Minimum-curvature splines for DEM and displacement
@@ -48,10 +69,10 @@ cd(out) do
 
     # Vent marker + label, colorbar, frame
     open("star_$(label).txt", "w") do io
-        write(io, "-22.272 63.890\n")
+        write(io, "$(vlon) $(vlat)\n")
     end
     open("lab_$(label).txt", "w") do io
-        write(io, "-22.272 63.898 9 0 0 LM Geldingadalur\n")
+        @printf(io, "%s %.4f 9 0 0 LM %s\n", vlon, parse(Float64, vlat) + 0.008, vname)
     end
     gmt("psxy star_$(label).txt $R $J -Sa0.45c -Gblack -W0.5p,white -K -O >> map_$(label).ps")
     gmt("pstext lab_$(label).txt $R $J -K -O >> map_$(label).ps")
