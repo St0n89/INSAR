@@ -327,7 +327,7 @@ function fetch_chunk(url::String, outdir::String; attempts::Int = 6)
             sleep(attempt == 1 ? 10.0 : 40.0)
             continue
         end
-        rm(tmp; force = true)
+        part_rm!(tmp)
         if occursin("\"error\"", s)
             if occursin("try again", lowercase(s))
                 println("    rate-limited by the API, pausing 65 s...")
@@ -745,7 +745,7 @@ function s2_fetch_tiles(lat::Float64, lon::Float64, z::Int, nx::Int, ny::Int,
             tmp = joinpath(outdir, ".tmp_tile.jpg")
             Downloads.download(url, tmp)
             d = read(tmp)
-            rm(tmp; force = true)
+            part_rm!(tmp)                    # Windows AV/indexer lock: retry
             tile = decode_jpeg(d)
             Ht, Wt = size(tile, 1), size(tile, 2)
             img[jy*256+1:jy*256+Ht, ix*256+1:ix*256+Wt, :] .= tile
@@ -768,6 +768,79 @@ function s2_pixel_of(lat::Float64, lon::Float64, z::Int, tx0::Int, ty0::Int)
     wx = (lon + 180) / 360 * n * 256
     wy = (1 - asinh(tan(deg2rad(lat))) / π) / 2 * n * 256
     return 1 + wx - tx0 * 256, 1 + wy - ty0 * 256
+end
+
+"""Fetch s2cloudless tiles covering a lon/lat bbox (map background).
+zreq > 0 pins the zoom level; otherwise the largest z <= 14 whose tile
+count stays within maxtiles is used. Returns (img, z, tx0, ty0)."""
+function s2_fetch_bbox(lonmin::Float64, lonmax::Float64,
+                        latmin::Float64, latmax::Float64,
+                        year::Int, zreq::Int, maxtiles::Int, outdir::String)
+    z = zreq > 0 ? zreq : 14
+    tx0 = tx1 = ty0 = ty1 = n = 0
+    while true
+        n = 2^z
+        tx0 = floor(Int, (lonmin + 180) / 360 * n)
+        tx1 = floor(Int, (lonmax + 180) / 360 * n)
+        ty0 = floor(Int, (1 - asinh(tan(deg2rad(latmax))) / π) / 2 * n)
+        ty1 = floor(Int, (1 - asinh(tan(deg2rad(latmin))) / π) / 2 * n)
+        (tx1 - tx0 + 1) * (ty1 - ty0 + 1) <= maxtiles && break
+        z <= 8 && break
+        z -= 1
+    end
+    tx0 = max(0, tx0); tx1 = min(n - 1, tx1)
+    ty0 = max(0, ty0); ty1 = min(n - 1, ty1)
+    nx = tx1 - tx0 + 1; ny = ty1 - ty0 + 1
+    img = fill(UInt8(28), 256 * ny, 256 * nx, 3)
+    misses = 0
+    for jy in 0:ny-1, ix in 0:nx-1
+        x = tx0 + ix; y = ty0 + jy
+        url = "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-" * string(year) *
+              "_3857/default/GoogleMapsCompatible/" * string(z) * "/" *
+              string(y) * "/" * string(x) * ".jpg"
+        try
+            tmp = joinpath(outdir, ".tmp_tile.jpg")
+            Downloads.download(url, tmp)
+            d = read(tmp)
+            part_rm!(tmp)                    # Windows AV/indexer lock: retry
+            tile = decode_jpeg(d)
+            Ht, Wt = size(tile, 1), size(tile, 2)
+            img[jy*256+1:jy*256+Ht, ix*256+1:ix*256+Wt, :] .= tile
+        catch err
+            misses += 1
+            println("  tile ", x, ",", y, " unavailable (",
+                    first(sprint(showerror, err), 60), ")")
+        end
+        @printf("  tiles %d/%d\r", jy * nx + ix + 1, nx * ny)
+        flush(stdout)
+        sleep(0.12)
+    end
+    @printf("  s2cloudless %d mosaic: zoom %d, %dx%d tiles (%d missing)\n",
+            year, z, nx, ny, misses)
+    return img, z, tx0, ty0
+end
+
+"""Bilinear RGB sample of the stitched s2 tile mosaic; (NaN,NaN,NaN)
+outside. Used by the satellite map background."""
+function s2_bil_rgb(img::Array{UInt8,3}, sy::Float64, sx::Float64)
+    Ht, Wt = size(img, 1), size(img, 2)
+    (sy < 1.0 || sx < 1.0 || sy > Float64(Ht) || sx > Float64(Wt)) &&
+        return (NaN, NaN, NaN)
+    sy = clamp(sy, 1.001, Float64(Ht) - 0.001)
+    sx = clamp(sx, 1.001, Float64(Wt) - 0.001)
+    y0 = floor(Int, sy); x0 = floor(Int, sx)
+    fy = sy - y0; fx = sx - x0
+    r = g = b = 0.0
+    for (dy, dx, w) in ((0, 0, (1-fx)*(1-fy)), (0, 1, fx*(1-fy)),
+                        (1, 0, (1-fx)*fy), (1, 1, fx*fy))
+        y = y0 + dy; x = x0 + dx
+        if 1 <= y <= Ht && 1 <= x <= Wt
+            r += w * Float64(img[y, x, 1])
+            g += w * Float64(img[y, x, 2])
+            b += w * Float64(img[y, x, 3])
+        end
+    end
+    return (r, g, b)
 end
 
 # ----------------------------------------------------------------------------
@@ -1936,7 +2009,8 @@ function raw_selftest(ann::S1Annotation, tiffpath::String, t::SlcTiff;
     K0, K1 = measure_tops_rate(blk, ann, l0, p0)
     ka_mid = s1_ka(ann, tR, (p0 + p1) ÷ 2)
     @printf("  steering rate pass 1: K = %+.1f Hz/s (dK/dpx %+.2e)\n", K0, K1)
-    rate(t, px) = K0 + K1 * (px - p0)
+    Kc = Ref(K0)
+    rate(t, px) = Kc[] + K1 * (px - p0)
     b = copy(blk)
     converged = false
     for it in 1:3
@@ -1950,8 +2024,7 @@ function raw_selftest(ann::S1Annotation, tiffpath::String, t::SlcTiff;
         end
         # undo deramp, add correction (beta ~ 0.97 absorbed by iteration)
         tops_ramp!(b, ann, l0, p0, tR, +1, rate)
-        K0 += Kr
-        rate(t, px) = K0 + K1 * (px - p0)
+        Kc[] += Kr
         println()
     end
     @printf("  final steering rate K = %+.1f Hz/s | annotation k_a = %+.1f Hz/s (K/k_a = %.3f)\n",
@@ -2082,7 +2155,8 @@ function measure_steering_rate(ann::S1Annotation, blk::Matrix{ComplexF32},
     tR = tR_anchor === nothing ?
          s1_line_az_time(ann, l0 + size(blk, 1) ÷ 2) : tR_anchor
     K0, K1 = measure_tops_rate(blk, ann, l0, p0)
-    rate = (t, px) -> K0 + K1 * (px - p0)
+    Kc = Ref(K0)
+    rate = (t, px) -> Kc[] + K1 * (px - p0)   # Kc: update without rebinding
     b = copy(blk)
     converged = false
     for _ in 1:passes
@@ -2093,8 +2167,7 @@ function measure_steering_rate(ann::S1Annotation, blk::Matrix{ComplexF32},
             break
         end
         tops_ramp!(b, ann, l0, p0, tR, +1, rate)
-        K0 += Kr
-        rate = (t, px) -> K0 + K1 * (px - p0)
+        Kc[] += Kr
     end
     converged || tops_ramp!(b, ann, l0, p0, tR, -1, rate)
     return (K0, K1, converged, b)
@@ -2376,6 +2449,8 @@ function raw_ifg(annP::S1Annotation, tiffP_path::String, tP::SlcTiff;
                  vname::String = "Geldingadalur",
                  mtitle::String = "LOS deformation",
                  unwr::String = "wls",
+                 mapbg::String = "hill", s2year::Int = 2020,
+                 s2zoom::Int = 0,
                  outdir::String = "insar_out")
     annS === nothing && (annS = annP)
     tS === nothing && (tS = read_slc_tiff(tiffS_path))
@@ -2696,7 +2771,9 @@ function raw_ifg(annP::S1Annotation, tiffP_path::String, tP::SlcTiff;
                     write_los_map(joinpath(outdir, "map_" * label * ".bmp"),
                                   lat2g, lon2g, dres2, mask2, dem2g;
                                   title = mtitle,
-                                  vlat = vlat, vlon = vlon, vname = vname)
+                                  vlat = vlat, vlon = vlon, vname = vname,
+                                  bg = mapbg, s2year = s2year,
+                                  s2zoom = s2zoom)
                 end
             end
             write_bmp(joinpath(outdir,
@@ -3764,6 +3841,17 @@ function zip_range!(loc::Vector{String}, tok::String, prodname::String,
     error("range fetch failed for bytes $a-$b")
 end
 
+"""Remove a .part file; on Windows it can be locked for seconds by AV
+scanners / search indexers (EACCES on unlink), so retry and report."""
+function part_rm!(part::String)::Bool
+    for _ in 1:5
+        try rm(part; force = true) catch end
+        isfile(part) || return true
+        sleep(0.5)
+    end
+    !isfile(part)
+end
+
 """Download and extract one ZIP member (local header walk + chunked range
 fetch + raw-DEFLATE inflate or stored copy) with CRC32 verification."""
 function zip_fetch_member(loc::Vector{String}, tok::String, prodname::String,
@@ -3784,7 +3872,14 @@ function zip_fetch_member(loc::Vector{String}, tok::String, prodname::String,
     if isfile(part)
         done = filesize(part)
         if done > mem.csz
-            rm(part); done = 0
+            if part_rm!(part)
+                done = 0
+            else
+                part = outpath * ".part2"
+                println("    note: stale .part locked by another process, ",
+                        "using ", basename(part))
+                done = 0
+            end
         elseif done < mem.csz && done % chunk != 0
             done = (done ÷ chunk) * chunk
             truncate(part, done)
@@ -3815,7 +3910,9 @@ function zip_fetch_member(loc::Vector{String}, tok::String, prodname::String,
     else
         error("unsupported zip method ", mem.method)
     end
-    rm(part)
+    part_rm!(part) ||
+        println("    note: could not delete ", basename(part),
+                " (locked?) -- remove it manually later")
     filesize(outpath) == mem.usz ||
         error("size mismatch after inflate ($(filesize(outpath)) vs $(mem.usz))")
     got = crc32_file(outpath)
@@ -4003,11 +4100,14 @@ end
 Options: --lat --lon --date --date2 [--dtol N] [--pass auto|desc|asc]
 [--p1 NAME] [--p2 NAME] [--topo] [--nlines N] [--npix N] [--coh C] [--datadir DIR]
 [--vname NAME] [--unwrap qg|wls] [--iw iw1|iw2|iw3]
+[--mapbg hill|sat] [--s2year Y] [--s2zoom Z]
 (with --topo: native Vedurstofa-style LOS map BMP; --iw selects the subswath
 to download, default iw2. NOTE: pick the subswath that CONTAINS the target:
 s1_target_burst errors when the target is outside the azimuth window, but a
 target beyond the range edges can silently produce a block west of the vent.
-Fagradalsfjall: desc track = iw2, asc track = iw1.)"""
+Fagradalsfjall: desc track = iw2, asc track = iw1. --mapbg sat overlays the
+fringes at 65% over the real Sentinel-2 cloudless mosaic (EOX tiles, default
+year 2020 = pre-eruption landscape) instead of the grey hillshade.)"""
 function raw_pair_driver(opts::Dict{String,String}, outdir::String)
     lat = num(opts, "lat", NaN)
     lon = num(opts, "lon", NaN)
@@ -4092,6 +4192,9 @@ function raw_pair_driver(opts::Dict{String,String}, outdir::String)
             vname = get(opts, "vname", "Geldingadalur"),
             mtitle = "LOS deformation (" * replace(d1, "-" => "") * "-" *
                      replace(d2, "-" => "") * ")",
+            mapbg = get(opts, "mapbg", "hill"),
+            s2year = Int(num(opts, "s2year", 2020.0)),
+            s2zoom = Int(num(opts, "s2zoom", 0.0)),
             outdir = outdir)
     println("pair complete.")
 end
@@ -4244,14 +4347,19 @@ function raw_split(opts::Dict{String,String}, outdir::String)
     vlat = num(opts, "vlat", NaN); vlon = num(opts, "vlon", NaN)
     vname = get(opts, "vname", "Geldingadalur")
     m2 = .!isnan.(up)
+    mbg = get(opts, "mapbg", "hill")
+    myr = Int(num(opts, "s2year", 2020.0))
+    mzo = Int(num(opts, "s2zoom", 0.0))
     write_los_map(joinpath(outdir, "map_split_vertical.bmp"),
                   latd, lond, up, m2, demd;
                   title = "VERTICAL deformation (cm), dN=0 split",
-                  vlat = vlat, vlon = vlon, vname = vname)
+                  vlat = vlat, vlon = vlon, vname = vname,
+                  bg = mbg, s2year = myr, s2zoom = mzo)
     write_los_map(joinpath(outdir, "map_split_east.bmp"),
                   latd, lond, ea, m2, demd;
                   title = "EAST deformation (cm), dN=0 split",
-                  vlat = vlat, vlon = vlon, vname = vname)
+                  vlat = vlat, vlon = vlon, vname = vname,
+                  bg = mbg, s2year = myr, s2zoom = mzo)
     for (nm, fld) in (("vertical", up), ("east", ea))
         open(joinpath(outdir, "split_" * nm * ".xyz"), "w") do io
             for j in 1:Hd, i in 1:Wd
@@ -5459,7 +5567,9 @@ function write_los_map(path::String, latg::Matrix{Float64}, long::Matrix{Float64
                        dem::Matrix{Float64};
                        title::String = "LOS deformation",
                        vlat::Float64 = NaN, vlon::Float64 = NaN,
-                       vname::String = "Geldingadalur")
+                       vname::String = "Geldingadalur",
+                       bg::String = "hill", s2year::Int = 2020,
+                       s2zoom::Int = 0)
     H2, W2 = size(latg)
     (H2 < 8 || W2 < 8) && (println("  map: grid too small, skipping"); return)
 
@@ -5529,6 +5639,15 @@ function write_los_map(path::String, latg::Matrix{Float64}, long::Matrix{Float64
     Wtot = mapW + ML + MR
     img = fill(UInt8(255), Htot, Wtot, 3)
 
+    # ---- optional Sentinel-2 background (visual range) -----------------
+    s2img = nothing
+    s2z = 0; s2tx0 = 0; s2ty0 = 0
+    if bg == "sat"
+        s2img, s2z, s2tx0, s2ty0 =
+            s2_fetch_bbox(lonmin, lonmax, latmin, latmax, s2year,
+                          s2zoom, s2zoom > 0 ? 400 : 96, dirname(path))
+    end
+
     # ---- background + displacement (affine inverse + bilinear) ---------
     sample(g::Matrix{Float64}, la::Float64, lo::Float64) = begin
         dy = (la - a) * f - (lo - d) * c
@@ -5560,6 +5679,22 @@ function write_los_map(path::String, latg::Matrix{Float64}, long::Matrix{Float64
         if isnan(demv)
             img[MT+py, ML+px, 1] = 250; img[MT+py, ML+px, 2] = 250
             img[MT+py, ML+px, 3] = 252
+        elseif bg == "sat" && s2img !== nothing
+            sxx, syy = s2_pixel_of(la, lo, s2z, s2tx0, s2ty0)
+            sr, sg, sb = s2_bil_rgb(s2img, syy, sxx)
+            if isnan(sr)
+                shv = clamp(sample(shade, la, lo), 0.0, 1.0)
+                g = 205 + 45 * shv
+                img[MT+py, ML+px, 1] = to8(g); img[MT+py, ML+px, 2] = to8(g)
+                img[MT+py, ML+px, 3] = to8(0.98g)
+            else
+                shv = sample(shade, la, lo)
+                isnan(shv) && (shv = 0.8)
+                s2f = 0.62 + 0.38 * clamp(shv, 0.0, 1.0)   # relief-shaded sat
+                img[MT+py, ML+px, 1] = to8(sr * s2f)
+                img[MT+py, ML+px, 2] = to8(sg * s2f)
+                img[MT+py, ML+px, 3] = to8(sb * s2f)
+            end
         elseif isLand
             shv = clamp(sample(shade, la, lo), 0.0, 1.0)
             g = 205 + 45 * shv
@@ -5574,21 +5709,42 @@ function write_los_map(path::String, latg::Matrix{Float64}, long::Matrix{Float64
             dv = sample(dispf, la, lo)
             if !isnan(dv)
                 jc = map_jet(clamp((dv + zs) / (2zs), 0.0, 1.0))
-                img[MT+py, ML+px, 1] = to8(jc[1])
-                img[MT+py, ML+px, 2] = to8(jc[2])
-                img[MT+py, ML+px, 3] = to8(jc[3])
+                if bg == "sat" && s2img !== nothing
+                    al = 0.65                # fringes over imagery
+                    img[MT+py, ML+px, 1] = to8(al * jc[1] +
+                        (1 - al) * img[MT+py, ML+px, 1])
+                    img[MT+py, ML+px, 2] = to8(al * jc[2] +
+                        (1 - al) * img[MT+py, ML+px, 2])
+                    img[MT+py, ML+px, 3] = to8(al * jc[3] +
+                        (1 - al) * img[MT+py, ML+px, 3])
+                else
+                    img[MT+py, ML+px, 1] = to8(jc[1])
+                    img[MT+py, ML+px, 2] = to8(jc[2])
+                    img[MT+py, ML+px, 3] = to8(jc[3])
+                end
             end
         end
     end
 
-    # ---- coastline (land/ocean boundary from the DEM) -------------------
+    # ---- coastline (land/ocean boundary from the DEM, 2-px dark line) ---
+    coast = falses(mapH, mapW)
     for py in 1:mapH, px in 1:mapW
         if land[py, px] != get(land, (clamp(py+1,1,mapH), px), land[py,px]) ||
            land[py, px] != get(land, (clamp(py-1,1,mapH), px), land[py,px]) ||
            land[py, px] != get(land, (py, clamp(px+1,1,mapW)), land[py,px]) ||
            land[py, px] != get(land, (py, clamp(px-1,1,mapW)), land[py,px])
-            img[MT+py, ML+px, 1] = 70; img[MT+py, ML+px, 2] = 70
-            img[MT+py, ML+px, 3] = 70
+            coast[py, px] = true
+        end
+    end
+    for py in 1:mapH, px in 1:mapW
+        if coast[py, px] ||
+           get(coast, (clamp(py+1,1,mapH), px), false) ||
+           get(coast, (clamp(py-1,1,mapH), px), false) ||
+           get(coast, (py, clamp(px+1,1,mapW)), false) ||
+           get(coast, (py, clamp(px-1,1,mapW)), false)
+            img[MT+py, ML+px, 1] = 42
+            img[MT+py, ML+px, 2] = 46
+            img[MT+py, ML+px, 3] = 60
         end
     end
 
@@ -5772,6 +5928,7 @@ function usage()
                                       [--dtol N] [--pass auto|desc|asc] [--topo]
                                       [--nlines N] [--npix N] [--datadir DIR]
                                       [--unwrap qg|wls] [--iw iw1|iw2|iw3]
+                                      [--mapbg hill|sat] [--s2year Y]
                                       (end-to-end: CDSE catalogue search, ASF
                                       range-ZIP download (Earthdata token in
                                       earthdata.env or EARTHDATA_TOKEN), auto
@@ -5779,6 +5936,7 @@ function usage()
                                       interferogram; iw2-vv, cached in data/)
                         raw split   --desc DIR --asc DIR [--vlat F] [--vlon F]
                                       [--vname NAME] [--descgrid F] [--ascgrid F]
+                                      [--mapbg hill|sat] [--s2year Y]
                                       (asc/desc LOS decomposition: reads the
                                       grid_*.txt sidecars of two --topo runs,
                                       solves up+east per cell assuming dN=0,
@@ -6046,6 +6204,9 @@ function main()
                 vname = get(opts, "vname", "Geldingadalur"),
                 mtitle = get(opts, "mtitle", "LOS deformation"),
                 unwr = get(opts, "unwrap", "wls"),
+                mapbg = get(opts, "mapbg", "hill"),
+                s2year = Int(num(opts, "s2year", 2020.0)),
+                s2zoom = Int(num(opts, "s2zoom", 0.0)),
                 outdir = outdir)
         elseif sub == "dem"
             T === nothing && error("raw dem needs --tiff <slc measurement>")
