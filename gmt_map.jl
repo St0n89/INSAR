@@ -2,8 +2,7 @@
 #
 # This is the same pipeline as gmt_map.sh (validated classic-GMT reference),
 # wrapped for users who installed GMT via Julia (Pkg.add("GMT")).
-# Untested on Windows: if a gmt(...) call complains about redirection,
-# fall back to gmt_map.sh with the GMT binaries on PATH.
+# Called automatically at the end of `raw pair` when --map is given.
 #
 # Usage: julia gmt_map.jl [outdir] [label] [title] [vent_lon] [vent_lat] [vent_name]
 #   outdir   directory containing disp_<label>.xyz and dem_<label>.xyz
@@ -17,24 +16,29 @@ using Printf
 
 out    = length(ARGS) >= 1 ? ARGS[1] : "data/ifg_out/sq"
 label  = length(ARGS) >= 2 ? ARGS[2] : "raw_b8"
-title  = length(ARGS) >= 3 ? ARGS[3] : "LOS deformation (20210307-20210319)"
+title  = length(ARGS) >= 3 ? ARGS[3] : "LOS deformation"
 vlon   = length(ARGS) >= 4 ? ARGS[4] : "-22.272"
 vlat   = length(ARGS) >= 5 ? ARGS[5] : "63.890"
 vname  = length(ARGS) >= 6 ? ARGS[6] : "Geldingadalur"
 
-# Region = dem extents, grid = 201x201 nodes (exact multiples for nearneighbor)
-w, e, s, n = Inf, -Inf, Inf, -Inf
-demfile = joinpath(out, "dem_$(label).xyz")
-for line in eachline(demfile)
-    c = split(line)
-    length(c) >= 2 || continue
-    lo = parse(Float64, c[1]); la = parse(Float64, c[2])
-    lo < w && (w = lo); lo > e && (e = lo)
-    la < s && (s = la); la > n && (n = la)
+# bbox of the dem export (function scope: avoids the top-level
+# soft-scope ambiguity of assignments inside a for loop)
+function dem_bbox(path::String)
+    w, e, s, n = Inf, -Inf, Inf, -Inf
+    for line in eachline(path)
+        c = split(line)
+        length(c) >= 2 || continue
+        lo = parse(Float64, c[1]); la = parse(Float64, c[2])
+        lo < w && (w = lo); lo > e && (e = lo)
+        la < s && (s = la); la > n && (n = la)
+    end
+    return w, e, s, n
 end
+
+w, e, s, n = dem_bbox(joinpath(out, "dem_$(label).xyz"))
 w = round(w, digits = 4); e = round(e, digits = 4)
 s = round(s, digits = 4); n = round(n, digits = 4)
-ix = (e - w) / 200; iy = (n - s) / 200
+ix = (e - w) / 200; iy = (n - s) / 200          # 201x201 nodes, exact multiples
 R = @sprintf("-R%.4f/%.4f/%.4f/%.4f", w, e, s, n)
 I = @sprintf("-I%.10g/%.10g", ix, iy)
 J = "-JM14c"
