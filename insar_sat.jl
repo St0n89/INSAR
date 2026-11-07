@@ -3229,9 +3229,30 @@ end
 const HTTP_WCB = @cfunction(_http_write_cb, Csize_t,
                            (Ptr{Cvoid}, Csize_t, Csize_t, Ptr{Cvoid}))
 
+"""CA bundle path for CURLOPT_CAINFO, or "" to let the backend use its
+default (Windows: the system store via Schannel). Explicit env override
+wins; on Linux the distro bundle must be set explicitly because LibCURL's
+default lookup can fail in stripped environments (CURLE 60)."""
+function http_ca_bundle()::String
+    for p in (get(ENV, "SSL_CERT_FILE", ""),
+              get(ENV, "CURL_CA_BUNDLE", ""),
+              "/etc/ssl/certs/ca-certificates.crt",
+              "/etc/pki/tls/certs/ca-bundle.crt",
+              "/etc/ssl/ca-bundle.pem",
+              "/usr/local/etc/openssl/cert.pem",
+              "/etc/openssl/certs/ca-bundle.crt",
+              joinpath(Sys.BINDIR, "certs", "cacert.pem"),
+              joinpath(Sys.BINDIR, "..", "etc", "certs", "cacert.pem"))
+        (isempty(p) || !isfile(p)) && continue
+        return String(p)
+    end
+    return ""
+end
+
 """Single GET with manual redirect control. Returns (curl_rc, code, header,
-body). `rng` = "a-b" byte range. CAINFO set explicitly (LibCURL default CA
-lookup can fail in stripped environments -> CURLE 60)."""
+body). `rng` = "a-b" byte range. CAINFO only set when a bundle file exists;
+on Windows the bundled LibCURL uses the system certificate store instead
+(setting a nonexistent path there fails with CURLE 77)."""
 function http_get(url::String, hdrs::Vector{String} = String[];
                   rng::Union{Nothing,String} = nothing, timeout_s::Int = 120)
     HAVE_LIBCURL || error("LibCURL stdlib unavailable (need Julia >= 1.7)")
@@ -3250,8 +3271,8 @@ function http_get(url::String, hdrs::Vector{String} = String[];
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1)
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30)
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, Clong(timeout_s))
-    curl_easy_setopt(curl, CURLOPT_CAINFO,
-                     "/etc/ssl/certs/ca-certificates.crt")
+    ca = http_ca_bundle()
+    !isempty(ca) && curl_easy_setopt(curl, CURLOPT_CAINFO, ca)
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "")
     hl != C_NULL && curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hl)
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, HTTP_WCB)
