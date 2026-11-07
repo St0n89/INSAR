@@ -2523,9 +2523,12 @@ function raw_ifg(annP::S1Annotation, tiffP_path::String, tP::SlcTiff;
         count(!isnan, unw), count(mask), 100frac)
     img, imgc, imgd, dcm, stats = render_real_insar(pha, coh, unw, lam_cm, cohthr)
 
-    # --- display aspect: m per ML row/column from RD geolocation -------------
-    # one ML row spans mla azimuth lines (~mla*20 m), one ML column mlr range
-    # pixels (~mlr*3.7 m ground): the raw H x W grid squashes N-S by ~7-8x
+    # --- display geometry: square ground cells via 2nd-stage multilook ------
+    # one ML row spans ~mla*20 m azimuth, one ML column ~mlr*3.7 m ground
+    # range: raw grid pixels are ~7x longer than wide, and stretching them
+    # for display leaves vertical speckle streaks (filtering cannot fix
+    # that). LiCSAR-style look: regrid to (nearly) square ~100-120 m cells
+    # and render from those.
     hgt0 = (topo && annS !== annP) ? DEM_m[H ÷ 2, W ÷ 2] : 0.0
     lat0, lon0 = s1_geo_of_pixel_rd(annP, l0 + (H ÷ 2 - 0.5) * mla,
                                     p0 + (W ÷ 2 - 0.5) * mlr, hgt0)
@@ -2535,14 +2538,10 @@ function raw_ifg(annP::S1Annotation, tiffP_path::String, tP::SlcTiff;
                                     p0 + (W ÷ 2 + 0.5) * mlr, hgt0)
     daz = hypot((lat1 - lat0) * 111e3, (lon1 - lon0) * cosd(lat0) * 111e3)
     drg = hypot((lat2 - lat0) * 111e3, (lon2 - lon0) * cosd(lat0) * 111e3)
-    rowfac = max(1, round(Int, daz / drg))
-    fr = (2 * rowfac, 2)     # geometric row stretch + 2x readability zoom
-    @printf("  display aspect: ML pixel %.1f m (az) x %.1f m (rg), row stretch x%d\n",
-            daz, drg, rowfac)
-    write_bmp(joinpath(outdir, "coherence_" * label * ".bmp"),
-              upscale_img(imgc, fr...))
-    write_bmp(joinpath(outdir, "unwrapped_" * label * ".bmp"),
-              upscale_img(imgd, fr...))
+    azf = 1
+    rgf = max(1, round(Int, daz / drg))
+    @printf("  display: ML pixel %.1f m (az) x %.1f m (rg) -> square regrid %dx%d\n",
+            daz, drg, azf, rgf)
 
     # --- nicer renderings (v4.1): display mask + filtered + detrended ---------
     # display mask stricter than --coh: ocean/low-coherence speckle would
@@ -2550,40 +2549,90 @@ function raw_ifg(annP::S1Annotation, tiffP_path::String, tP::SlcTiff;
     dmask = (coh .>= max(cohthr, 0.35)) .& (.!isnan.(unw))
     nice = false
     if count(dmask) > 500
-        cf = filter_ifg_cpx(ifg, coh, dmask; r = 2)
         coef = quadfit_cm(dcm, dmask)
         if coef !== nothing
             fitm = quad_eval(coef, size(dcm))
             utr = -4π .* fitm ./ lam_cm          # trend in unwrapped-phase rad
-            # adaptive Goldstein on the DETRENDED complex interferogram
-            cg = goldstein_filter(ifg .* exp.(-1im .* utr), coh, dmask)
-            pha_g = angle.(cg)
+            # square-cell second stage
+            coh2 = regrid_mean(coh, azf, rgf)
+            amp2 = regrid_mean(amp, azf, rgf)
+            dcm2 = regrid_mean(dcm, azf, rgf)
+            mask2 = (coh2 .>= max(cohthr, 0.35)) .& (.!isnan.(dcm2))
+            c2u = regrid_cplx(ifg, coh, dmask, azf, rgf)
+            cdt = ifg .* exp.(-1im .* utr)
+            c2d = regrid_cplx(cdt, coh, dmask, azf, rgf)
+            dres2 = regrid_mean(dcm .- fitm, azf, rgf)
+            dres2 = filter_real(dres2, coh2, mask2; r = 3)
+            # adaptive Goldstein on the square-cell grid (smaller patches)
+            cg2 = goldstein_filter(c2d, coh2, mask2; paz = 16, prg = 32)
+            pha_g2 = angle.(cg2)
+            hs2 = (topo && annS !== annP) ?
+                hillshade(regrid_mean(DEM_m, azf, rgf), daz * azf, drg * rgf) :
+                nothing
+            zoom = 6
+            write_bmp(joinpath(outdir, "coherence_" * label * ".bmp"),
+                upscale_img(render_coh_img(coh2), zoom, zoom; bilinear = true))
+            mm = 0.0
+            for k in eachindex(dcm2)
+                isnan(dcm2[k]) || (mm = max(mm, abs(dcm2[k])))
+            end
+            write_bmp(joinpath(outdir, "unwrapped_" * label * ".bmp"),
+                upscale_img(render_defo_img(dcm2, .!isnan.(dcm2), max(mm, 0.5)),
+                            zoom, zoom; bilinear = true))
             write_bmp(joinpath(outdir, "interferogram_" * label * ".bmp"),
-                upscale_img(render_phase_img(angle.(cf), dmask), fr...))
+                upscale_img(render_phase_img(angle.(c2u), mask2), zoom, zoom;
+                            bilinear = true))
             write_bmp(joinpath(outdir,
                 "interferogram_detrended_" * label * ".bmp"),
-                upscale_img(render_phase_img(
-                    angle.(cf .* exp.(-1im .* utr)), dmask), fr...))
+                upscale_img(render_phase_img(angle.(c2d), mask2), zoom, zoom;
+                            bilinear = true))
             write_bmp(joinpath(outdir,
                 "interferogram_goldstein_" * label * ".bmp"),
-                upscale_img(render_phase_img(pha_g, dmask), fr...))
-            hs = (topo && annS !== annP) ? hillshade(DEM_m, daz, drg) : nothing
+                upscale_img(render_phase_img(pha_g2, mask2), zoom, zoom;
+                            bilinear = true))
+            # overlay background: DEM hillshade (smooth, map-like) when
+            # topo is on, SAR log-amplitude otherwise; a 3-cell box
+            # (~330 m) removes speckle/blockiness from either base
+            bmask = .!isnan.(amp2)
+            bwt = ones(size(amp2))
+            amp2b = filter_real(amp2, bwt, bmask; r = 3)
+            hs2b = hs2 === nothing ? nothing :
+                filter_real(hs2, bwt, bmask; r = 3)
+            dem2 = (topo && annS !== annP) ?
+                regrid_mean(DEM_m, azf, rgf) : nothing
+            # clean the display mask for the overlay: fill single-cell
+            # holes and drop isolated colour cells, so the coherent
+            # area renders as connected fringes instead of confetti
+            H2, W2 = size(mask2)
+            mc = Matrix{Int}(undef, H2, W2)
+            @inbounds for j in 1:H2, i in 1:W2
+                s = 0
+                for dj in -1:1, di in -1:1
+                    s += mask2[clamp(j + dj, 1, H2), clamp(i + di, 1, W2)]
+                end
+                mc[j, i] = s
+            end
+            mask2o = mask2 .& (mc .>= 3)
+            mask2o = mask2o .| ((.!mask2) .& (mc .>= 6))
             write_bmp(joinpath(outdir,
                 "interferogram_overlay_" * label * ".bmp"),
-                upscale_img(render_overlay_img(pha_g, dmask, amp, hs), fr...))
-            dres = dcm .- fitm
-            dres = filter_real(dres, coh, dmask; r = 4)   # display copy (9x9)
-            s = defo_scale(dres, dmask)
+                upscale_img(render_overlay_img(pha_g2, mask2o, amp2b, hs2b;
+                                                dem = dem2),
+                            zoom, zoom; bilinear = true))
+            s2 = defo_scale(dres2, mask2)
             write_bmp(joinpath(outdir, "unwrapped_defo_" * label * ".bmp"),
-                upscale_img(render_defo_img(dres, dmask, s), fr...))
-            @printf("  wrote filtered/detrended/Goldstein IFGs + terrain overlay + defo map (±%.1f cm, coh≥%.2f, %d px)\n",
-                s, max(cohthr, 0.35), count(dmask))
+                upscale_img(render_defo_img(dres2, mask2, s2), zoom, zoom;
+                            bilinear = true))
+            @printf("  wrote square-cell display suite %dx%d cells of %.0f x %.0f m (zoom x%d, coh≥%.2f, %d cells, defo ±%.1f cm)\n",
+                size(coh2)[1], size(coh2)[2], daz * azf, drg * rgf, zoom,
+                max(cohthr, 0.35), count(mask2), s2)
             nice = true
         end
     end
     if !nice
-        write_bmp(joinpath(outdir, "interferogram_" * label * ".bmp"),
-                  upscale_img(img, fr...))
+        write_bmp(joinpath(outdir, "coherence_" * label * ".bmp"), imgc)
+        write_bmp(joinpath(outdir, "unwrapped_" * label * ".bmp"), imgd)
+        write_bmp(joinpath(outdir, "interferogram_" * label * ".bmp"), img)
         @printf("  wrote interferogram/coherence/unwrapped BMPs to %s\n", outdir)
     end
 
@@ -4519,15 +4568,40 @@ function filter_real(v::Matrix{Float64}, coh::Matrix{Float64},
 end
 
 """Nearest-neighbour upscale of an RGB image: frow rows per pixel,
-fcol columns per pixel (frow > fcol corrects the az/rg pixel aspect)."""
-function upscale_img(img::Array{UInt8,3}, frow::Int, fcol::Int)
+fcol columns per pixel (frow > fcol corrects the az/rg pixel aspect).
+`bilinear=true` interpolates instead of replicating: smoother display
+for grayscale-dominated products (overlay); fringes stay crisp with
+the default nearest neighbour."""
+function upscale_img(img::Array{UInt8,3}, frow::Int, fcol::Int;
+                     bilinear::Bool = false)
     H, W = size(img, 1), size(img, 2)
     out = Array{UInt8}(undef, H * frow, W * fcol, 3)
-    @inbounds for j in 1:H, i in 1:W
-        for dj in 1:frow, di in 1:fcol
-            for c in 1:3
-                out[(j - 1) * frow + dj, (i - 1) * fcol + di, c] = img[j, i, c]
+    if !bilinear
+        @inbounds for j in 1:H, i in 1:W
+            for dj in 1:frow, di in 1:fcol
+                for c in 1:3
+                    out[(j - 1) * frow + dj, (i - 1) * fcol + di, c] =
+                        img[j, i, c]
+                end
             end
+        end
+        return out
+    end
+    # bilinear in source-cell coordinates (centres at 0.5, 0.5)
+    OH, OW = H * frow, W * fcol
+    @inbounds for J in 1:OH, I in 1:OW
+        y = (J - 0.5) / frow          # source row centre coord
+        x = (I - 0.5) / fcol
+        j0 = clamp(floor(Int, y), 1, H - 1)
+        i0 = clamp(floor(Int, x), 1, W - 1)
+        ty = clamp(y - j0, 0.0, 1.0)
+        tx = clamp(x - i0, 0.0, 1.0)
+        for c in 1:3
+            v = (1 - ty) * ((1 - tx) * img[j0, i0, c] +
+                            tx * img[j0, i0 + 1, c]) +
+                ty * ((1 - tx) * img[j0 + 1, i0, c] +
+                      tx * img[j0 + 1, i0 + 1, c])
+            out[J, I, c] = unsafe_trunc(UInt8, v)
         end
     end
     return out
@@ -4625,35 +4699,49 @@ function hillshade(dem::Matrix{Float64}, drow::Float64, dcol::Float64)
     return out
 end
 
-"""Fringes over a terrain background: log-amplitude grayscale (SAR
-texture), multiplied by the hillshade when a DEM grid is given, with
-the wrapped phase at `beta` opacity on masked pixels."""
+"""Fringes over a terrain background. When `dem` is given the base is
+the hillshade alone (smooth, map-like): land cells shaded by relief,
+ocean/lake cells (DEM <= 1 m) flat dark. Without `dem` the base is the
+log-amplitude (SAR texture) optionally multiplied by the hillshade.
+Wrapped phase at `beta` opacity on masked pixels."""
 function render_overlay_img(pha::Matrix{Float64}, mask::AbstractMatrix{Bool},
                             amp::Matrix{Float64}, hs::Union{Nothing,Matrix{Float64}};
-                            beta::Float64 = 0.55)
+                            beta::Float64 = 0.72,
+                            dem::Union{Nothing,Matrix{Float64}} = nothing)
     H, W = size(pha)
     v = [amp[k] for k in eachindex(amp) if !isnan(amp[k]) && amp[k] > 0]
     (isempty(v) || length(v) < 50) && (v = [0.0, 1.0])
     sort!(v)
-    a1 = v[max(1, round(Int, 0.02 * length(v)))]
-    a2 = v[min(end, round(Int, 0.98 * length(v)))]
+    a1 = v[max(1, round(Int, 0.05 * length(v)))]
+    a2 = v[min(end, round(Int, 0.95 * length(v)))]
     a2 > a1 || (a2 = a1 + 1.0)
     la1, la2 = log1p(a1), log1p(a2)
     img = Array{UInt8}(undef, H, W, 3)
     @inbounds for j in 1:H, i in 1:W
-        g = isnan(amp[j, i]) ? a1 : clamp(amp[j, i], a1, a2)
-        t = (log1p(g) - la1) / (la2 - la1)
-        shade = hs === nothing ? 1.0 : (0.35 + 0.65 * hs[j, i])
-        gv = 28.0 + 200.0 * clamp(t, 0.0, 1.0) * shade
+        if dem !== nothing
+            d = isnan(dem[j, i]) ? 0.0 : dem[j, i]
+            shade = hs === nothing ? 1.0 : (0.35 + 0.65 * hs[j, i])
+            gv = d <= 1.0 ? 52.0 : 58.0 + 165.0 * shade
+        else
+            g = isnan(amp[j, i]) ? a1 : clamp(amp[j, i], a1, a2)
+            t = (log1p(g) - la1) / (la2 - la1)
+            shade = hs === nothing ? 1.0 : (0.35 + 0.65 * hs[j, i])
+            gv = 40.0 + 180.0 * clamp(t, 0.0, 1.0) * shade
+        end
         if mask[j, i]
             rgb = insar_cmap(mod(pha[j, i] / (2π), 1.0))
-            img[j, i, 1] = to8((1 - beta) * gv + beta * 255.0 * rgb[1])
-            img[j, i, 2] = to8((1 - beta) * gv + beta * 255.0 * rgb[2])
-            img[j, i, 3] = to8((1 - beta) * gv + beta * 255.0 * rgb[3])
+            img[j, i, 1] = to8((1 - beta) * gv + beta * rgb[1])
+            img[j, i, 2] = to8((1 - beta) * gv + beta * rgb[2])
+            img[j, i, 3] = to8((1 - beta) * gv + beta * rgb[3])
+        elseif dem !== nothing && ((isnan(dem[j, i]) ? 0.0 : dem[j, i]) <= 1.0)
+            # water: cool slate tint reads as ocean/coastline
+            img[j, i, 1] = to8(0.80 * gv)
+            img[j, i, 2] = to8(0.92 * gv)
+            img[j, i, 3] = to8(1.10 * gv)
         else
-            img[j, i, 1] = to8(0.55 * gv)
-            img[j, i, 2] = to8(0.55 * gv)
-            img[j, i, 3] = to8(0.55 * gv)
+            img[j, i, 1] = to8(0.72 * gv)
+            img[j, i, 2] = to8(0.72 * gv)
+            img[j, i, 3] = to8(0.72 * gv)
         end
     end
     return img
@@ -4687,6 +4775,59 @@ function render_defo_img(dres::Matrix{Float64}, mask::AbstractMatrix{Bool}, s::F
         else
             img[j, i, 1] = 24; img[j, i, 2] = 24; img[j, i, 3] = 30
         end
+    end
+    return img
+end
+
+"""Second-stage multilook: mean of a real field over azf x rgf blocks
+(partial blocks at the edges); NaN values are skipped."""
+function regrid_mean(v::Matrix{Float64}, azf::Int, rgf::Int)
+    H, W = size(v)
+    H2 = cld(H, azf); W2 = cld(W, rgf)
+    out = Matrix{Float64}(undef, H2, W2)
+    @inbounds for jj in 1:H2, ii in 1:W2
+        j0 = (jj - 1) * azf + 1; j1 = min(j0 + azf - 1, H)
+        i0 = (ii - 1) * rgf + 1; i1 = min(i0 + rgf - 1, W)
+        s = 0.0; n = 0
+        for j in j0:j1, i in i0:i1
+            x = v[j, i]
+            if !isnan(x); s += x; n += 1; end
+        end
+        out[jj, ii] = n > 0 ? s / n : NaN
+    end
+    return out
+end
+
+"""Second-stage multilook of a complex interferogram:
+coherence-weighted mean over azf x rgf blocks; only `mask` pixels
+contribute weight."""
+function regrid_cplx(c::Matrix{ComplexF64}, coh::Matrix{Float64},
+                     mask::AbstractMatrix{Bool}, azf::Int, rgf::Int)
+    H, W = size(c)
+    H2 = cld(H, azf); W2 = cld(W, rgf)
+    out = Matrix{ComplexF64}(undef, H2, W2)
+    @inbounds for jj in 1:H2, ii in 1:W2
+        j0 = (jj - 1) * azf + 1; j1 = min(j0 + azf - 1, H)
+        i0 = (ii - 1) * rgf + 1; i1 = min(i0 + rgf - 1, W)
+        acc = 0.0 + 0.0im; ws = 0.0
+        for j in j0:j1, i in i0:i1
+            if mask[j, i]
+                acc += coh[j, i] * c[j, i]; ws += coh[j, i]
+            end
+        end
+        out[jj, ii] = ws > 0 ? acc / ws : 0.0 + 0.0im
+    end
+    return out
+end
+
+"""Coherence map render: every cell through the coherence colormap."""
+function render_coh_img(coh::Matrix{Float64})
+    H, W = size(coh)
+    img = Array{UInt8}(undef, H, W, 3)
+    @inbounds for j in 1:H, i in 1:W
+        c = coh_cmap(clamp01(coh[j, i]))
+        img[j, i, 1] = to8(c[1]); img[j, i, 2] = to8(c[2])
+        img[j, i, 3] = to8(c[3])
     end
     return img
 end
