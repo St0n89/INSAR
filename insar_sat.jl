@@ -4002,7 +4002,12 @@ end
 """raw pair: catalogue search + ASF download + auto block + interferogram.
 Options: --lat --lon --date --date2 [--dtol N] [--pass auto|desc|asc]
 [--p1 NAME] [--p2 NAME] [--topo] [--nlines N] [--npix N] [--coh C] [--datadir DIR]
-[--vname NAME] [--unwrap qg|wls]  (with --topo: native Vedurstofa-style LOS map BMP)"""
+[--vname NAME] [--unwrap qg|wls] [--iw iw1|iw2|iw3]
+(with --topo: native Vedurstofa-style LOS map BMP; --iw selects the subswath
+to download, default iw2. NOTE: pick the subswath that CONTAINS the target:
+s1_target_burst errors when the target is outside the azimuth window, but a
+target beyond the range edges can silently produce a block west of the vent.
+Fagradalsfjall: desc track = iw2, asc track = iw1.)"""
 function raw_pair_driver(opts::Dict{String,String}, outdir::String)
     lat = num(opts, "lat", NaN)
     lon = num(opts, "lon", NaN)
@@ -4051,9 +4056,10 @@ function raw_pair_driver(opts::Dict{String,String}, outdir::String)
     s2t != 0.0 && @printf("secondary : %s  (start %s)\n", s2name,
             Dates.format(Dates.unix2datetime(s2t), "yyyy-mm-dd HH:MM:SS"))
     s2t != 0.0 && @printf("pair dt   : %.3f d\n", (s2t - p1t) / 86400)
-    println("download: ASF range-ZIP (Earthdata bearer), iw2-vv...")
-    tiff1, xml1 = s1_pair_download(p1name, datadir, tok)
-    tiff2, xml2 = s1_pair_download(s2name, datadir, tok)
+    println("download: ASF range-ZIP (Earthdata bearer), ",
+            get(opts, "iw", "iw2"), "-vv...")
+    tiff1, xml1 = s1_pair_download(p1name, datadir, tok; iw = get(opts, "iw", "iw2"))
+    tiff2, xml2 = s1_pair_download(s2name, datadir, tok; iw = get(opts, "iw", "iw2"))
     A1 = parse_s1_annotation(xml1)
     A2 = parse_s1_annotation(xml2)
     if passwant in ("desc", "asc")
@@ -5765,7 +5771,7 @@ function usage()
                         raw pair    --lat F --lon F --date D1 --date2 D2
                                       [--dtol N] [--pass auto|desc|asc] [--topo]
                                       [--nlines N] [--npix N] [--datadir DIR]
-                                      [--unwrap qg|wls]
+                                      [--unwrap qg|wls] [--iw iw1|iw2|iw3]
                                       (end-to-end: CDSE catalogue search, ASF
                                       range-ZIP download (Earthdata token in
                                       earthdata.env or EARTHDATA_TOKEN), auto
