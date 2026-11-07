@@ -3275,11 +3275,19 @@ function http_get(url::String, hdrs::Vector{String} = String[];
     !isempty(ca) && curl_easy_setopt(curl, CURLOPT_CAINFO, ca)
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "")
     hl != C_NULL && curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hl)
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, HTTP_WCB)
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, pointer_from_objref(bref))
-    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, HTTP_WCB)
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, pointer_from_objref(href))
-    rc = curl_easy_perform(curl)
+    # GC.@preserve pins bref/href: they are handed to C as raw pointers
+    # (WRITEDATA/HEADERDATA). Without pinning the GC may move the Refs
+    # mid-transfer (EXCEPTION_ACCESS_VIOLATION in the write callback,
+    # seen on Windows/Julia 1.13; on 1.11/Linux the Ref was stack-
+    # allocated by luck). Canonical ccall pattern: pointer_from_objref
+    # must stay inside GC.@preserve together with the whole perform.
+    GC.@preserve bref href begin
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, HTTP_WCB)
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, pointer_from_objref(bref))
+        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, HTTP_WCB)
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, pointer_from_objref(href))
+        rc = curl_easy_perform(curl)
+    end
     code = Ref{Clong}()
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, code)
     curl_easy_cleanup(curl)
