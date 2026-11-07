@@ -2614,6 +2614,33 @@ function raw_ifg(annP::S1Annotation, tiffP_path::String, tP::SlcTiff;
             end
             mask2o = mask2 .& (mc .>= 3)
             mask2o = mask2o .| ((.!mask2) .& (mc .>= 6))
+            # --- external cartography export (GMT & friends) ---------------
+            # GeoASCII xyz: x=lon y=lat z=value. disp = the smoothed
+            # detrended LOS field shown in the BMP suite [cm]; dem = GLO-90
+            # on the same cells [m] for hillshade backgrounds.
+            if topo && annS !== annP
+                lat2g = regrid_mean(lat_m, azf, rgf)
+                lon2g = regrid_mean(lon_m, azf, rgf)
+                dem2g = regrid_mean(DEM_m, azf, rgf)
+                open(joinpath(outdir, "disp_" * label * ".xyz"), "w") do io
+                    for jj in 1:H2, ii in 1:W2
+                        if mask2[jj, ii] && !isnan(dres2[jj, ii])
+                            @printf(io, "%.6f %.6f %.3f\n",
+                                lon2g[jj, ii], lat2g[jj, ii], dres2[jj, ii])
+                        end
+                    end
+                end
+                open(joinpath(outdir, "dem_" * label * ".xyz"), "w") do io
+                    for jj in 1:H2, ii in 1:W2
+                        if !isnan(dem2g[jj, ii])
+                            @printf(io, "%.6f %.6f %.1f\n",
+                                lon2g[jj, ii], lat2g[jj, ii], dem2g[jj, ii])
+                        end
+                    end
+                end
+                @printf("  exported disp_%s.xyz (%d pts) + dem_%s.xyz for GMT\n",
+                    label, count(mask2 .& (.!isnan.(dres2))), label)
+            end
             write_bmp(joinpath(outdir,
                 "interferogram_overlay_" * label * ".bmp"),
                 upscale_img(render_overlay_img(pha_g2, mask2o, amp2b, hs2b;
