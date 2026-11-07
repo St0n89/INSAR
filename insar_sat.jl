@@ -3453,11 +3453,24 @@ function asf_presigned(prodname::String, tok::String)::Tuple{String,Int}
     rc, code, head, _ = http_get(u1, ["Authorization: Bearer " * tok];
                                 rng = "0-0", timeout_s = 60)
     loc = http_location(head)
+    lhost = isempty(loc) ? "" :
+            (m = match(r"https?://[^/]+", loc); m === nothing ? "?" : m.match)
+    prox = !isempty(get(ENV, "https_proxy", "")) ||
+           !isempty(get(ENV, "HTTPS_PROXY", ""))
+    diag = "toklen=$(length(tok))" * (prox ? ", proxy env SET" : "")
     # accept any redirect (303 on HTTP/2, 302 seen on Windows/HTTP/1.1);
     # the Location is the presigned CloudFront URL either way
     if code in (301, 302, 303, 307, 308) && !isempty(loc)
+        occursin("urs.earthdata.nasa.gov", loc) &&
+            error("ASF saw NO valid Authorization header (redirect to " *
+                  "Earthdata login, $code; $diag). Either earthdata.env " *
+                  "is corrupted (token must be ONE line, no spaces or " *
+                  "backslashes; a valid edl-jwt is 690 chars) or something " *
+                  "on this machine/network strips the header (AV, TLS-" *
+                  "intercepting proxy).")
         rc2, code2, head2, _ = http_get(loc; rng = "0-0", timeout_s = 60)
-        (rc2 == 0 && code2 == 206) || error("presigned probe failed (rc=$rc2 code=$code2)")
+        (rc2 == 0 && code2 == 206) ||
+            error("presigned probe failed (rc=$rc2 code=$code2, host=$lhost, $diag)")
         m = match(r"content-range:\s*bytes\s+(\d+)-(\d+)/(\d+)", lowercase(head2))
         m === nothing && error("no Content-Range on presigned probe")
         return (loc, parse(Int, m[3]))
@@ -3467,7 +3480,9 @@ function asf_presigned(prodname::String, tok::String)::Tuple{String,Int}
         m === nothing && error("200 without Content-Length")
         return (u1, parse(Int, m[1]))
     end
-    error("ASF resolve failed (rc=$rc code=$code)")
+    error("ASF resolve failed (rc=$rc code=$code" *
+          (isempty(lhost) ? "" : ", location host: " * lhost) *
+          "; $diag)")
 end
 
 struct ZipMember
