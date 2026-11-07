@@ -56,6 +56,7 @@ using Random
 using Downloads
 using LinearAlgebra   # mul!/transpose for the 8x8 IDCTs
 using Dates           # S1 annotation timestamps (raw command)
+using Mmap            # zero-RAM view of fetched zip members (3 GB hosts)
 
 # ----------------------------------------------------------------------------
 # 1. Small helpers
@@ -2653,6 +2654,44 @@ function raw_ifg(annP::S1Annotation, tiffP_path::String, tP::SlcTiff;
                 end
                 @printf("  exported disp_%s.xyz (%d pts) + dem_%s.xyz for GMT\n",
                     label, count(mask2 .& (.!isnan.(dres2))), label)
+                # --- split sidecar: full cell grid + LOS geometry ----------
+                # raw split needs everything on one rectangular grid with
+                # known dimensions plus the toward-satellite ENU unit
+                # vector at the block centre (from the true orbit).
+                tc = s1_line_az_time(annP,
+                        round(Int, l0 + (H ÷ 2 - 0.5) * mla - 0.5))
+                psat = s1_orbit_pos(annP, tc)
+                vsat = s1_orbit_vel(annP, tc)
+                jc = clamp(H ÷ 2 + 1, 1, H); ic = clamp(W ÷ 2 + 1, 1, W)
+                tge = geodetic_ecef(lat_m[jc, ic], lon_m[jc, ic],
+                                    DEM_m[jc, ic])
+                los = psat .- tge
+                los ./= norm(los)
+                la_c = lat_m[jc, ic] * pi / 180
+                lo_c = lon_m[jc, ic] * pi / 180
+                e_e = (-sin(lo_c), cos(lo_c), 0.0)
+                e_n = (-sin(la_c) * cos(lo_c), -sin(la_c) * sin(lo_c),
+                       cos(la_c))
+                e_u = (cos(la_c) * cos(lo_c), cos(la_c) * sin(lo_c),
+                       sin(la_c))
+                ux = los[1] * e_e[1] + los[2] * e_e[2] + los[3] * e_e[3]
+                uy = los[1] * e_n[1] + los[2] * e_n[2] + los[3] * e_n[3]
+                uz = los[1] * e_u[1] + los[2] * e_u[2] + los[3] * e_u[3]
+                # flight azimuth from the orbit velocity
+                vx = vsat[1] * e_e[1] + vsat[2] * e_e[2] + vsat[3] * e_e[3]
+                vy = vsat[1] * e_n[1] + vsat[2] * e_n[2] + vsat[3] * e_n[3]
+                hdg = mod(atand(vx, vy), 360.0)
+                open(joinpath(outdir, "grid_" * label * ".txt"), "w") do io
+                    @printf(io, "# %d %d %.6f %.6f %.6f %.2f\n",
+                            H2, W2, ux, uy, uz, hdg)
+                    for jj in 1:H2, ii in 1:W2
+                        @printf(io, "%.6f %.6f %.3f %.1f\n",
+                                lon2g[jj, ii], lat2g[jj, ii],
+                                dres2[jj, ii], dem2g[jj, ii])
+                    end
+                end
+                @printf("  exported grid_%s.txt (%dx%d cells, LOS enu %+.3f %+.3f %+.3f, heading %.1f deg)\n",
+                        label, H2, W2, ux, uy, uz, hdg)
                 if !sim
                     write_los_map(joinpath(outdir, "map_" * label * ".bmp"),
                                   lat2g, lon2g, dres2, mask2, dem2g;
@@ -3507,17 +3546,19 @@ function json_pairs(s::AbstractString)::Vector{Tuple{Float64,Float64}}
 end
 
 """All SENTINEL1 IW SLC products of a UTC day window whose footprint contains
-(lat, lon). Returns (name, t_start, t_stop) tuples, name without .SAFE."""
+(lat, lon). Returns (name, t_start, t_stop, orbit_dir) tuples, name without
+.SAFE; orbit_dir is "" when the catalogue omits the attribute."""
 function odata_find_day(t0::String, t1::String, lat::Float64, lon::Float64)
     q = "https://catalogue.dataspace.copernicus.eu/odata/v1/Products" *
         "?\$top=1000&\$filter=Collection/Name%20eq%20%27SENTINEL-1%27" *
         "%20and%20contains(Name,%27_IW_SLC__1SDV%27)" *
         "%20and%20ContentDate/Start%20ge%20" * t0 *
-        "%20and%20ContentDate/Start%20le%20" * t1
+        "%20and%20ContentDate/Start%20le%20" * t1 *
+        "&\$expand=Attributes"
     rc, code, _, body = http_get(q; timeout_s = 90)
     (rc != 0 || code != 200) && error("OData query failed (rc=$rc code=$code)")
     txt = String(body)
-    out = Tuple{String,Float64,Float64}[]
+    out = Tuple{String,Float64,Float64,String}[]
     idxs = [m.offset for m in eachmatch(r"\"Name\":\"(S1[AB]_IW_SLC[^\"]+)\"", txt)]
     for k in eachindex(idxs)
         o = idxs[k]
@@ -3530,16 +3571,19 @@ function odata_find_day(t0::String, t1::String, lat::Float64, lon::Float64)
         arr === nothing && continue
         coords = json_pairs(arr)
         (length(coords) >= 3 && point_in_poly(coords, lon, lat)) || continue
+        odm = match(r"\"Name\":\"orbitDirection\",\"Value\":\"(ASCENDING|DESCENDING)\"", seg)
+        od = odm === nothing ? "" : String(odm[1])
         endswith(nm, ".SAFE") && (nm = nm[1:end-5])
-        push!(out, (String(nm), parse_s1_time(cm[1]), parse_s1_time(cm[2])))
+        push!(out, (String(nm), parse_s1_time(cm[1]), parse_s1_time(cm[2]), od))
     end
     return out
 end
 
 """All catalogue candidates within +/- dtol days of the target date whose
-footprint contains the point. Returns (name, t_start) tuples."""
+footprint contains the point. With passdir != "" only that orbit direction
+(ASCENDING/DESCENDING) is kept. Returns (name, t_start) tuples."""
 function odata_candidates(date::String, lat::Float64, lon::Float64;
-                          dtol::Int = 1)
+                          dtol::Int = 1, passdir::String = "")
     y, m, d = parse.(Int, split(date, "-"))
     base = Dates.Date(y, m, d)
     out = Vector{Tuple{String,Float64}}()
@@ -3547,8 +3591,9 @@ function odata_candidates(date::String, lat::Float64, lon::Float64;
     for off in 0:dtol
         for s in (off == 0 ? (0,) : (-off, off))
             day = Dates.format(base + Dates.Day(s), "yyyy-mm-dd")
-            for (nm, t, _) in odata_find_day(day * "T00:00:00.000Z",
+            for (nm, t, _, od) in odata_find_day(day * "T00:00:00.000Z",
                                              day * "T23:59:59.999Z", lat, lon)
+                (isempty(passdir) || od == passdir) || continue
                 if !(nm in seen)
                     push!(seen, nm)
                     push!(out, (nm, t))
@@ -3731,15 +3776,36 @@ function zip_fetch_member(loc::Vector{String}, tok::String, prodname::String,
     nlen = Int(reinterpret(UInt16, lh[27:28])[1])
     elen = Int(reinterpret(UInt16, lh[29:30])[1])
     dstart = mem.lho + 30 + nlen + elen
-    comp = Vector{UInt8}()
-    sizehint!(comp, mem.csz)
+    # chunked fetch into a persistent .part file: an interrupted transfer
+    # (dropped link, killed process) resumes at the last 16 MB boundary
+    # instead of restarting the whole member from zero
+    part = outpath * ".part"
     done = 0
-    while done < mem.csz
-        b = min(done + chunk, mem.csz) - 1
-        append!(comp, zip_range!(loc, tok, prodname, dstart + done, dstart + b))
-        done = b + 1
-        quiet || @printf("    %6.1f / %6.1f MB\r", done / 2^20, mem.csz / 2^20)
+    if isfile(part)
+        done = filesize(part)
+        if done > mem.csz
+            rm(part); done = 0
+        elseif done < mem.csz && done % chunk != 0
+            done = (done ÷ chunk) * chunk
+            truncate(part, done)
+        end
+        done < mem.csz &&
+            @printf("    resuming at %.1f / %.1f MB\n", done / 2^20, mem.csz / 2^20)
     end
+    if done < mem.csz
+        open(part, done == 0 ? "w" : "a") do io
+            while done < mem.csz
+                b = min(done + chunk, mem.csz) - 1
+                write(io, zip_range!(loc, tok, prodname, dstart + done, dstart + b))
+                flush(io)
+                done = b + 1
+                quiet || @printf("    %6.1f / %6.1f MB\r", done / 2^20, mem.csz / 2^20)
+            end
+        end
+    end
+    # mmap the member instead of read(): a 1 GB part in RAM plus the
+    # inflate workspace OOMs small hosts; the mapping stays out of RSS
+    comp = Mmap.mmap(part)
     if mem.method == 8
         inflate_to_file(comp, outpath)
     elseif mem.method == 0
@@ -3749,6 +3815,7 @@ function zip_fetch_member(loc::Vector{String}, tok::String, prodname::String,
     else
         error("unsupported zip method ", mem.method)
     end
+    rm(part)
     filesize(outpath) == mem.usz ||
         error("size mismatch after inflate ($(filesize(outpath)) vs $(mem.usz))")
     got = crc32_file(outpath)
@@ -3757,16 +3824,18 @@ function zip_fetch_member(loc::Vector{String}, tok::String, prodname::String,
                        basename(outpath), got, mem.crc))
 end
 
-"""Download iw2-vv measurement TIFF + annotation XML of an ASF S1 SLC
-product into datadir, reusing files already present (naming convention
-asf<disc>_iw2_vv.tiff / <disc>_iw2_vv.xml). Verifies CRC32 from the zip
+"""Download iw-vv (default iw2) measurement TIFF + annotation XML of an ASF
+S1 SLC product into datadir, reusing files already present (naming convention
+asf<disc>_<iw>_vv.tiff / <disc>_<iw>_vv.xml). Verifies CRC32 from the zip
 central directory and MD5 from manifest.safe. Returns (tiff, xml)."""
-function s1_pair_download(prodname::String, datadir::String, tok::String)
+function s1_pair_download(prodname::String, datadir::String, tok::String;
+                          iw::String = "iw2")
+    iw in ("iw1", "iw2", "iw3") || error("iw must be iw1|iw2|iw3")
     disc = split(prodname, "_")[end]
-    tiff = joinpath(datadir, "asf" * disc * "_iw2_vv.tiff")
-    xml = joinpath(datadir, disc * "_iw2_vv.xml")
+    tiff = joinpath(datadir, "asf" * disc * "_" * iw * "_vv.tiff")
+    xml = joinpath(datadir, disc * "_" * iw * "_vv.xml")
     if isfile(tiff) && isfile(xml)
-        println("  ", disc, ": iw2-vv pair already cached, reusing")
+        println("  ", disc, ": ", iw, "-vv pair already cached, reusing")
         return (tiff, xml)
     end
     mkpath(datadir)
@@ -3777,14 +3846,14 @@ function s1_pair_download(prodname::String, datadir::String, tok::String)
     locv = [loc]
     annm = nothing; tifm = nothing; manm = nothing
     for m in members
-        occursin("/annotation/", m.name) && occursin("iw2-slc-vv", m.name) &&
+        occursin("/annotation/", m.name) && occursin(iw * "-slc-vv", m.name) &&
             (annm = m)
-        occursin("/measurement/", m.name) && occursin("iw2-slc-vv", m.name) &&
+        occursin("/measurement/", m.name) && occursin(iw * "-slc-vv", m.name) &&
             (tifm = m)
         endswith(m.name, "manifest.safe") && (manm = m)
     end
-    tifm === nothing && error("no iw2-vv measurement member in zip")
-    annm === nothing && error("no iw2-vv annotation member in zip")
+    tifm === nothing && error("no ", iw, "-vv measurement member in zip")
+    annm === nothing && error("no ", iw, "-vv annotation member in zip")
     @printf("  %s: annotation %d B, tiff %.1f MB (compressed)\n",
             disc, annm.usz, tifm.csz / 2^20)
     println("  ", disc, ": fetching annotation...")
@@ -3822,7 +3891,7 @@ function s1_pair_download(prodname::String, datadir::String, tok::String)
     println("  ", disc, ": tiff MD5 ", md5got)
     md5ok = false
     for (fn, md5) in md5map
-        if endswith(fn, ".tiff") && occursin("iw2-slc-vv", fn)
+        if endswith(fn, ".tiff") && occursin(iw * "-slc-vv", fn)
             if lowercase(md5) == md5got
                 md5ok = true
                 println("  ", disc, ": MD5 matches manifest.safe ✓")
@@ -3932,7 +4001,7 @@ end
 # ---- the pair driver ---------------------------------------------------------
 """raw pair: catalogue search + ASF download + auto block + interferogram.
 Options: --lat --lon --date --date2 [--dtol N] [--pass auto|desc|asc]
-[--topo] [--nlines N] [--npix N] [--coh C] [--datadir DIR]
+[--p1 NAME] [--p2 NAME] [--topo] [--nlines N] [--npix N] [--coh C] [--datadir DIR]
 [--vname NAME] [--unwrap qg|wls]  (with --topo: native Vedurstofa-style LOS map BMP)"""
 function raw_pair_driver(opts::Dict{String,String}, outdir::String)
     lat = num(opts, "lat", NaN)
@@ -3951,29 +4020,47 @@ function raw_pair_driver(opts::Dict{String,String}, outdir::String)
     @printf("pair driver: target %.4f, %.4f  dates %s -> %s (tol %d d)\n",
             lat, lon, d1, d2, dtol)
     println("catalogue: CDSE OData search (footprint point-in-polygon)...")
-    c1 = odata_candidates(d1, lat, lon; dtol = dtol)
-    c2 = odata_candidates(d2, lat, lon; dtol = dtol)
-    p1name, p1t = odata_pick(c1, d1)
-    @printf("primary   : %s  (start %s)\n", p1name,
-            Dates.format(Dates.unix2datetime(p1t), "yyyy-mm-dd HH:MM:SS"))
-    # secondary: same track + pass => nearly identical UTC start time
-    s2name, s2t = odata_pick(c2, d2; tod_ref = p1t)
-    if s2name == ""
+    pd = passwant in ("desc", "asc") ?
+         (passwant == "asc" ? "ASCENDING" : "DESCENDING") : ""
+    c1 = odata_candidates(d1, lat, lon; dtol = dtol, passdir = pd)
+    c2 = odata_candidates(d2, lat, lon; dtol = dtol, passdir = pd)
+    p1ovr = get(opts, "p1", "")
+    p2ovr = get(opts, "p2", "")
+    s2t = 0.0
+    if !isempty(p1ovr)
+        # explicit product override (--p1, optionally --p2): catalogue
+        # footprints overlap between slices; this pins the exact slice
+        p1name = p1ovr
+        println("primary   : ", p1name, "  (--p1 override)")
+        s2name = p2ovr
+        if isempty(s2name)
+            s2name, s2t = odata_pick(c2, d2)
+        else
+            println("secondary : ", s2name, "  (--p2 override)")
+        end
+    else
+        p1name, p1t = odata_pick(c1, d1)
+        @printf("primary   : %s  (start %s)\n", p1name,
+                Dates.format(Dates.unix2datetime(p1t), "yyyy-mm-dd HH:MM:SS"))
+        # secondary: same track + pass => nearly identical UTC start time
+        s2name, s2t = odata_pick(c2, d2; tod_ref = p1t)
+    end
+    isempty(s2name) &&
         error("no same-time-of-day product near ", d2,
               " (different track/pass); try other dates or --lat/--lon")
-    end
-    @printf("secondary : %s  (start %s)\n", s2name,
+    s2t != 0.0 && @printf("secondary : %s  (start %s)\n", s2name,
             Dates.format(Dates.unix2datetime(s2t), "yyyy-mm-dd HH:MM:SS"))
-    dt = s2t - p1t
-    @printf("pair dt   : %.3f d\n", dt / 86400)
+    s2t != 0.0 && @printf("pair dt   : %.3f d\n", (s2t - p1t) / 86400)
     println("download: ASF range-ZIP (Earthdata bearer), iw2-vv...")
     tiff1, xml1 = s1_pair_download(p1name, datadir, tok)
     tiff2, xml2 = s1_pair_download(s2name, datadir, tok)
     A1 = parse_s1_annotation(xml1)
     A2 = parse_s1_annotation(xml2)
     if passwant in ("desc", "asc")
-        A1.pass_dir == passwant || error("primary pass is $(A1.pass_dir), wanted $passwant")
-        A2.pass_dir == passwant || error("secondary pass is $(A2.pass_dir), wanted $passwant")
+        startswith(lowercase(A1.pass_dir), passwant) ||
+            error("primary pass is $(A1.pass_dir), wanted $passwant")
+        startswith(lowercase(A2.pass_dir), passwant) ||
+            error("secondary pass is $(A2.pass_dir), wanted $passwant")
     end
     println("annotations: primary $(A1.pass_dir) $(A1.mission), ",
             "secondary $(A2.pass_dir) $(A2.mission), ",
@@ -4001,6 +4088,175 @@ function raw_pair_driver(opts::Dict{String,String}, outdir::String)
                      replace(d2, "-" => "") * ")",
             outdir = outdir)
     println("pair complete.")
+end
+
+# ----------------------------------------------------------------------------
+# 13. Ascending/descending decomposition (raw split)
+# ----------------------------------------------------------------------------
+# Reads the grid_<label>.txt sidecars that raw ifg/pair --topo writes (one
+# per orbit direction), bilinearly samples the ascending LOS field onto the
+# descending cell grid, and solves the 2-observation LOS system per cell.
+# The sidecar disp is the interferometric range change in cm (positive =
+# ground moved AWAY from the satellite), i.e. d = -(m . los_hat) with the
+# sidecar (ux, uy, uz) the unit ENU vector from ground toward the satellite:
+#     d_desc = -(up*uz_d + east*ux_d + north*uy_d)
+#     d_asc  = -(up*uz_a + east*ux_a + north*uy_a)
+# with the standard dN = 0 assumption (both Sentinel-1 orbits fly close to
+# N-S, so north is weakly observed; the remaining 2x2 system in (up, east)
+# is well conditioned because the two geometries look to opposite sides).
+# Both inputs are the tilt-removed display fields, so the outputs inherit
+# that referencing. Outputs: vertical + east grids [cm] as xyz, and two
+# native maps (hillshade/DEM from the descending side).
+
+"""Parse a grid_<label>.txt sidecar ->
+(H2, W2, ux, uy, uz, heading, lon, lat, disp, dem)."""
+function split_read_grid(path::String)
+    isfile(path) || error("no grid file: ", path)
+    lines = readlines(path)
+    startswith(lines[1], "#") || error("grid file has no header: ", path)
+    hd = split(strip(lines[1][2:end]))
+    H2 = parse(Int, hd[1]); W2 = parse(Int, hd[2])
+    ux = parse(Float64, hd[3]); uy = parse(Float64, hd[4])
+    uz = parse(Float64, hd[5]); hdg = parse(Float64, hd[6])
+    lon = fill(NaN, H2, W2); lat = fill(NaN, H2, W2)
+    disp = fill(NaN, H2, W2); dem = fill(NaN, H2, W2)
+    k = 0
+    for ln in lines[2:end]
+        isempty(strip(ln)) && continue
+        k += 1
+        k > H2 * W2 && error("grid file too long: ", path)
+        f = split(ln)
+        j = (k - 1) ÷ W2 + 1; i = (k - 1) % W2 + 1
+        lon[j, i] = parse(Float64, f[1]); lat[j, i] = parse(Float64, f[2])
+        disp[j, i] = parse(Float64, f[3]); dem[j, i] = parse(Float64, f[4])
+    end
+    k == H2 * W2 ||
+        error("grid file truncated: ", path, " (", k, " of ", H2 * W2, ")")
+    return H2, W2, ux, uy, uz, hdg, lon, lat, disp, dem
+end
+
+"""Least-squares affine fit  lat = a + b*j + c*i, lon = d + e*j + f*i."""
+function split_geo_affine(latg::Matrix{Float64}, long::Matrix{Float64})
+    H2, W2 = size(latg)
+    n = Float64(H2 * W2)
+    sj = si = sjj = sii = sji = 0.0
+    sa = sl = sa_j = sa_i = sl_j = sl_i = 0.0
+    for j in 1:H2, i in 1:W2
+        fj = Float64(j); fi = Float64(i)
+        la = latg[j, i]; lo = long[j, i]
+        sj += fj; si += fi; sjj += fj * fj; sii += fi * fi; sji += fj * fi
+        sa += la; sl += lo
+        sa_j += la * fj; sa_i += la * fi
+        sl_j += lo * fj; sl_i += lo * fi
+    end
+    A = [n sj si; sj sjj sji; si sji sii]
+    a, b, c = A \ [sa, sa_j, sa_i]
+    d, e, f = A \ [sl, sl_j, sl_i]
+    return a, b, c, d, e, f
+end
+
+"""(lon, lat) -> fractional (j, i) in the affine-fitted grid."""
+function split_geo_inv(af, lo::Float64, la::Float64)
+    a, b, c, d, e, f = af
+    det = b * f - c * e
+    abs(det) < 1e-14 && return NaN, NaN
+    dj = ((la - a) * f - (lo - d) * c) / det
+    di = (-(la - a) * e + (lo - d) * b) / det
+    return dj, di
+end
+
+"""NaN-aware bilinear sample of M at fractional (j, i); NaN corners are
+weighted out instead of poisoning the cell."""
+function split_bil(M::Matrix{Float64}, jf::Float64, iF::Float64)
+    H2, W2 = size(M)
+    (jf >= 1 && jf <= H2 && iF >= 1 && iF <= W2) || return NaN
+    jf <= 1 && (jf = 1.001); jf >= H2 && (jf = H2 - 0.001)
+    iF <= 1 && (iF = 1.001); iF >= W2 && (iF = W2 - 0.001)
+    j0 = floor(Int, jf); i0 = floor(Int, iF)
+    u = jf - j0; v = iF - i0
+    sw = 0.0; s = 0.0
+    for (dj, di, w) in ((0, 0, (1 - u) * (1 - v)), (0, 1, (1 - u) * v),
+                        (1, 0, u * (1 - v)), (1, 1, u * v))
+        x = M[j0 + dj, i0 + di]
+        if !isnan(x)
+            s += w * x; sw += w
+        end
+    end
+    return sw > 0 ? s / sw : NaN
+end
+
+"""raw split --desc DIR --asc DIR: 2-geometry LOS decomposition."""
+function raw_split(opts::Dict{String,String}, outdir::String)
+    descd = get(opts, "desc", ""); ascd = get(opts, "asc", "")
+    (isempty(descd) || isempty(ascd)) &&
+        error("raw split needs --desc DIR --asc DIR (raw pair/ifg --topo outputs)")
+    find_grid(dir, ovr) = begin
+        isempty(ovr) || return joinpath(dir, ovr)
+        cands = sort(filter(f -> startswith(f, "grid_") && endswith(f, ".txt"),
+                            readdir(dir)))
+        isempty(cands) && error("no grid_*.txt in ", dir,
+            " -- rerun raw pair/ifg --topo with a current insar_sat.jl")
+        length(cands) > 1 &&
+            println("  note: several grid files in ", dir, ", using ", cands[end])
+        return joinpath(dir, cands[end])
+    end
+    pD = find_grid(descd, get(opts, "descgrid", ""))
+    pA = find_grid(ascd, get(opts, "ascgrid", ""))
+    Hd, Wd, uxd, uyd, uzd, hdgd, lond, latd, dispd, demd = split_read_grid(pD)
+    Ha, Wa, uxa, uya, uza, hdga, lona, lata, dispa, dema = split_read_grid(pA)
+    @printf("  desc: %s  %dx%d cells, heading %.1f deg, LOS enu (%+.3f %+.3f %+.3f)\n",
+            pD, Hd, Wd, hdgd, uxd, uyd, uzd)
+    @printf("  asc : %s  %dx%d cells, heading %.1f deg, LOS enu (%+.3f %+.3f %+.3f)\n",
+            pA, Ha, Wa, hdga, uxa, uya, uza)
+    det0 = uzd * uxa - uza * uxd
+    abs(det0) < 0.05 &&
+        error("LOS vectors too parallel for a split (det ", round(det0, digits=3),
+              ") -- are both geometries really asc/desc?")
+    af_a = split_geo_affine(lata, lona)
+    up = fill(NaN, Hd, Wd); ea = fill(NaN, Hd, Wd)
+    nv = 0
+    for j in 1:Hd, i in 1:Wd
+        dd = dispd[j, i]
+        isnan(dd) && continue
+        ja, ia = split_geo_inv(af_a, lond[j, i], latd[j, i])
+        isnan(ja) && continue
+        da = split_bil(dispa, ja, ia)
+        isnan(da) && continue
+        up[j, i] = -(uxa * dd - uxd * da) / det0
+        ea[j, i] = -(uzd * da - uza * dd) / det0
+        nv += 1
+    end
+    @printf("  split: %d / %d desc cells solved (up+east, dN = 0 assumed)\n",
+            nv, Hd * Wd)
+    nv == 0 && error("no overlap between the two grids -- check --desc/--asc")
+    # stats (robust: 1-99 pct)
+    ups = sort([abs(up[j, i]) for j in 1:Hd, i in 1:Wd if !isnan(up[j, i])])
+    eas = sort([abs(ea[j, i]) for j in 1:Hd, i in 1:Wd if !isnan(ea[j, i])])
+    p98(v) = v[max(1, length(v) - max(1, length(v) ÷ 100))]
+    @printf("  |up|  1-99 pct max %.2f cm;  |east| 1-99 pct max %.2f cm\n",
+            p98(ups), p98(eas))
+    vlat = num(opts, "vlat", NaN); vlon = num(opts, "vlon", NaN)
+    vname = get(opts, "vname", "Geldingadalur")
+    m2 = .!isnan.(up)
+    write_los_map(joinpath(outdir, "map_split_vertical.bmp"),
+                  latd, lond, up, m2, demd;
+                  title = "VERTICAL deformation (cm), dN=0 split",
+                  vlat = vlat, vlon = vlon, vname = vname)
+    write_los_map(joinpath(outdir, "map_split_east.bmp"),
+                  latd, lond, ea, m2, demd;
+                  title = "EAST deformation (cm), dN=0 split",
+                  vlat = vlat, vlon = vlon, vname = vname)
+    for (nm, fld) in (("vertical", up), ("east", ea))
+        open(joinpath(outdir, "split_" * nm * ".xyz"), "w") do io
+            for j in 1:Hd, i in 1:Wd
+                if !isnan(fld[j, i])
+                    @printf(io, "%.6f %.6f %.3f\n",
+                            lond[j, i], latd[j, i], fld[j, i])
+                end
+            end
+        end
+        @printf("  wrote split_%s.xyz (%d pts)\n", nm, count(!isnan, fld))
+    end
 end
 
 # ----------------------------------------------------------------------------
@@ -5515,6 +5771,12 @@ function usage()
                                       earthdata.env or EARTHDATA_TOKEN), auto
                                       block clear of burst seams, pair
                                       interferogram; iw2-vv, cached in data/)
+                        raw split   --desc DIR --asc DIR [--vlat F] [--vlon F]
+                                      [--vname NAME] [--descgrid F] [--ascgrid F]
+                                      (asc/desc LOS decomposition: reads the
+                                      grid_*.txt sidecars of two --topo runs,
+                                      solves up+east per cell assuming dN=0,
+                                      writes split_vertical/east xyz + 2 maps)
                         raw dem     --ann XML --tiff TIFF [--burst N]
                                       [--l0 L] [--l1 L] [--p0 P] [--p1 P]
                                       [--mla A] [--mlr R] [--stride S]
@@ -5732,6 +5994,10 @@ function main()
             raw_pair_driver(opts, outdir)
             println("done.")
             return
+        elseif sub == "split"
+            raw_split(opts, outdir)
+            println("done.")
+            return
         end
         annpath = get(opts, "ann", "")
         isempty(annpath) && error("raw needs --ann <S1 annotation xml>")
@@ -5788,7 +6054,7 @@ function main()
                 stride = Int(num(opts, "stride", 4.0)),
                 outdir = outdir)
         else
-            println("raw: unknown subcommand '", sub, "' (info | selftest | ifg | dem)")
+            println("raw: unknown subcommand '", sub, "' (info | selftest | ifg | pair | split | dem)")
         end
         println("done.")
         return
