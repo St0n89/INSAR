@@ -1,4 +1,8 @@
-# insar_sat.jl — satellite imagery & InSAR: simulations + real interferograms
+# Roundworld (insar_sat.jl) — satellite imagery & InSAR: simulations + real interferograms
+
+*From the Discworld's point of view, Roundworld is the experiment —
+this is the other one: a pure-Julia-stdlib satellite imagery & InSAR
+laboratory that prefers real photons to hand-waving.*
 
 Pure **Julia standard library** (Printf, Random, Downloads, LinearAlgebra).
 No packages, no build step, no API key. One file. Runs on Julia ≥ 1.9.
@@ -152,6 +156,47 @@ phase removal) needs the free **Copernicus Data Space Ecosystem**
 account (`https://dataspace.copernicus.eu/`) plus ISCE/SNAP — out of
 scope for a stdlib tool.
 
+## RAW Sentinel-1 SLC processing (`raw` command, v4)
+
+The `raw` command is the from-scratch route: real level-1 IW SLC data,
+pure stdlib — a hand-written FFT, TIFF reader, TOPS burst model, GCP
+coregistration, interferogram, coherence, unwrapping and deformation
+statistics, all the way from the original product ZIPs.
+
+    # annotation + measurement summary, land scan, burst timing check
+    julia insar_sat.jl raw info --ann s1a-iw1-....xml --tiff s1a-iw1-....tiff --scan
+
+    # TOPS machinery self-test on a burst block: measures the antenna
+    # steering phase rate, deramps, checks the azimuth resampling roundtrip
+    julia insar_sat.jl raw selftest --ann ... --tiff ... --burst 8 \
+        --l0 12840 --l1 13490 --p0 14000 --p1 18000
+
+    # the fully automated pair driver: catalog search -> ASF download
+    # -> auto block -> coreg -> interferogram, fringes + deformation
+    julia insar_sat.jl raw pair --lat 63.885 --lon -22.280 \
+        --date 2021-03-07 --date2 2021-03-19 --topo
+
+Implemented (all validated end-to-end on the Fagradalsfjall 2021 dike
+intrusion): S1 annotation XML parser (burst timing, state vectors, GCP
+grid, FM-rate/DC polynomials — line timing validated to 0.25 ms against
+all 210 GCPs), stripped complex-int16 TIFF reader, hand-written radix-2
+FFT (1e-14 vs naive DFT), TOPS burst timing model, deramp/shift/reramp
+azimuth resampling, range resampling, range-Doppler geolocation,
+GCP-based coregistration (incl. cross-satellite S1A/S1B pairs),
+interferogram + coherence, GLO-90 topographic phase removal
+(Open-Meteo elevation API, cached + resumable), statistical
+unwrap, and a 2-D-quadratic deformation report in centimeters LOS.
+
+`raw pair` needs a NASA EarthData bearer token for the ASF download
+route: put `EARTHDATA_TOKEN=...` in `earthdata.env` next to the script
+(or export the variable). That file is private — it is git-ignored,
+never commit it.
+
+Everything has a manual fallback: `raw info`, `raw selftest`, `raw ifg`
+take explicit `--ann`/`--tiff`/block arguments when you already have
+the files; `raw pair` is the one-command route for arbitrary
+coordinates and dates (it picks the nearest same-track products).
+
 ## Real-data notes (Open-Meteo elevation API)
 
 - free, no key; grids are fetched in 100-coordinate batches
@@ -225,3 +270,10 @@ scope for a stdlib tool.
 BMP → PNG conversion (the tool intentionally stays stdlib-only):
 `magick out/*.bmp out/%d.png`, or ImageMagick-free:
 `python3 -c "from PIL import Image; [Image.open(f).save(f[:-4]+'.png') for f in __import__('glob').glob('out/*.bmp')]"`
+
+---
+
+<p align="center"><em>“The universe, they said, depends for its operation on ALL of its rules.”<br>
+— Roundworld is a world in a bottle, and so is this one.</em></p>
+
+**GNU Terry Pratchett.**

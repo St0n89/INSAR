@@ -10,3 +10,9 @@ dem_*.txt.part
 *.jl.mem
 *.jl.cov
 Manifest.toml
+
+# CDSE S3 credentials — NEVER commit (public repo!)
+cdse_s3.env
+
+# NASA EarthData bearer token — NEVER commit (public repo!)
+earthdata.env
