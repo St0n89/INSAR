@@ -742,10 +742,12 @@ function s2_fetch_tiles(lat::Float64, lon::Float64, z::Int, nx::Int, ny::Int,
               "_3857/default/GoogleMapsCompatible/" * string(z) * "/" *
               string(y) * "/" * string(x) * ".jpg"
         try
-            tmp = joinpath(outdir, ".tmp_tile.jpg")
+            tmp = joinpath(outdir, ".tmp_tile_" * string(y) * "_" *
+                           string(x) * ".jpg")
+            part_rm!(tmp)                # stale/locked leftovers: clear first
             Downloads.download(url, tmp)
             d = read(tmp)
-            part_rm!(tmp)                    # Windows AV/indexer lock: retry
+            part_rm!(tmp)                # Windows AV/indexer lock: retry
             tile = decode_jpeg(d)
             Ht, Wt = size(tile, 1), size(tile, 2)
             img[jy*256+1:jy*256+Ht, ix*256+1:ix*256+Wt, :] .= tile
@@ -799,10 +801,12 @@ function s2_fetch_bbox(lonmin::Float64, lonmax::Float64,
               "_3857/default/GoogleMapsCompatible/" * string(z) * "/" *
               string(y) * "/" * string(x) * ".jpg"
         try
-            tmp = joinpath(outdir, ".tmp_tile.jpg")
+            tmp = joinpath(outdir, ".tmp_tile_" * string(y) * "_" *
+                           string(x) * ".jpg")
+            part_rm!(tmp)                # stale/locked leftovers: clear first
             Downloads.download(url, tmp)
             d = read(tmp)
-            part_rm!(tmp)                    # Windows AV/indexer lock: retry
+            part_rm!(tmp)                # Windows AV/indexer lock: retry
             tile = decode_jpeg(d)
             Ht, Wt = size(tile, 1), size(tile, 2)
             img[jy*256+1:jy*256+Ht, ix*256+1:ix*256+Wt, :] .= tile
@@ -2711,24 +2715,10 @@ function raw_ifg(annP::S1Annotation, tiffP_path::String, tP::SlcTiff;
                 lat2g = regrid_mean(lat_m, azf, rgf)
                 lon2g = regrid_mean(lon_m, azf, rgf)
                 dem2g = regrid_mean(DEM_m, azf, rgf)
-                open(joinpath(outdir, "disp_" * label * ".xyz"), "w") do io
-                    for jj in 1:H2, ii in 1:W2
-                        if mask2[jj, ii] && !isnan(dres2[jj, ii])
-                            @printf(io, "%.6f %.6f %.3f\n",
-                                lon2g[jj, ii], lat2g[jj, ii], dres2[jj, ii])
-                        end
-                    end
-                end
-                open(joinpath(outdir, "dem_" * label * ".xyz"), "w") do io
-                    for jj in 1:H2, ii in 1:W2
-                        if !isnan(dem2g[jj, ii])
-                            @printf(io, "%.6f %.6f %.1f\n",
-                                lon2g[jj, ii], lat2g[jj, ii], dem2g[jj, ii])
-                        end
-                    end
-                end
-                @printf("  exported disp_%s.xyz (%d pts) + dem_%s.xyz for GMT\n",
-                    label, count(mask2 .& (.!isnan.(dres2))), label)
+                # xyz exports + auto-generated, self-configuring GMT script
+                write_gmt_script(outdir, label, mtitle, lat2g, lon2g,
+                                 dres2, mask2, dem2g;
+                                 vlat = vlat, vlon = vlon, vname = vname)
                 # --- split sidecar: full cell grid + LOS geometry ----------
                 # raw split needs everything on one rectangular grid with
                 # known dimensions plus the toward-satellite ENU unit
@@ -4217,6 +4207,16 @@ end
 # that referencing. Outputs: vertical + east grids [cm] as xyz, and two
 # native maps (hillshade/DEM from the descending side).
 
+"""Flight heading [deg] from a grid sidecar header line (# H W ux uy uz hdg).
+Used by raw split to auto-pick asc/desc grids when a directory has several."""
+function grid_heading(path::String)::Float64
+    open(path, "r") do io
+        ln = readline(io)
+        startswith(ln, "#") || error("not a grid sidecar: ", path)
+        return parse(Float64, split(strip(ln[2:end]))[6])
+    end
+end
+
 """Parse a grid_<label>.txt sidecar ->
 (H2, W2, ux, uy, uz, heading, lon, lat, disp, dem)."""
 function split_read_grid(path::String)
@@ -4299,18 +4299,33 @@ function raw_split(opts::Dict{String,String}, outdir::String)
     descd = get(opts, "desc", ""); ascd = get(opts, "asc", "")
     (isempty(descd) || isempty(ascd)) &&
         error("raw split needs --desc DIR --asc DIR (raw pair/ifg --topo outputs)")
-    find_grid(dir, ovr) = begin
+    find_grid(dir, ovr, want) = begin
         isempty(ovr) || return joinpath(dir, ovr)
         cands = sort(filter(f -> startswith(f, "grid_") && endswith(f, ".txt"),
                             readdir(dir)))
         isempty(cands) && error("no grid_*.txt in ", dir,
             " -- rerun raw pair/ifg --topo with a current insar_sat.jl")
-        length(cands) > 1 &&
-            println("  note: several grid files in ", dir, ", using ", cands[end])
-        return joinpath(dir, cands[end])
+        if length(cands) == 1
+            return joinpath(dir, cands[1])
+        end
+        # several sidecars: auto-pick by flight heading (desc ~190 deg,
+        # asc ~350 deg). Unambiguous only for exactly one match.
+        picks = String[]
+        for c in cands
+            hd = grid_heading(joinpath(dir, c))
+            ok = want == "desc" ? (150 <= hd && hd <= 240) :
+                                 (hd >= 320 || hd <= 40)
+            ok && push!(picks, c)
+        end
+        length(picks) == 1 && return joinpath(dir, picks[1])
+        error("several grid_*.txt in ", dir, ", cannot pick the ", want,
+              " one (headings: ",
+              join([c * "=" * string(round(grid_heading(joinpath(dir, c)),
+                    digits = 1)) for c in cands], ", "),
+              ") -- pass --descgrid FILE / --ascgrid FILE")
     end
-    pD = find_grid(descd, get(opts, "descgrid", ""))
-    pA = find_grid(ascd, get(opts, "ascgrid", ""))
+    pD = find_grid(descd, get(opts, "descgrid", ""), "desc")
+    pA = find_grid(ascd, get(opts, "ascgrid", ""), "asc")
     Hd, Wd, uxd, uyd, uzd, hdgd, lond, latd, dispd, demd = split_read_grid(pD)
     Ha, Wa, uxa, uya, uza, hdga, lona, lata, dispa, dema = split_read_grid(pA)
     @printf("  desc: %s  %dx%d cells, heading %.1f deg, LOS enu (%+.3f %+.3f %+.3f)\n",
@@ -4370,6 +4385,11 @@ function raw_split(opts::Dict{String,String}, outdir::String)
             end
         end
         @printf("  wrote split_%s.xyz (%d pts)\n", nm, count(!isnan, fld))
+        write_gmt_script(outdir, "split_" * nm,
+                         uppercase(nm) * " deformation (cm), dN=0 split",
+                         latd, lond, fld, m2, demd;
+                         vlat = vlat, vlon = vlon, vname = vname,
+                         cbar = uppercasefirst(nm) * " displacement [cm]")
     end
 end
 
@@ -5838,6 +5858,146 @@ function write_los_map(path::String, latg::Matrix{Float64}, long::Matrix{Float64
     end
 
     write_bmp(path, img)
+end
+
+"""Auto-write a ready-to-run GMT 6 (classic) script + xyz exports for one
+deformation field. Region, grid spacing, smoothing, colour range, support
+mask radius, colourbar step and coastline resolution are all derived from
+the data, so the same call works for any scene size or location; the
+generated gmt_map_<label>.sh never needs hand-editing (bash it with the
+gmt binaries on PATH; pscoast fetches shoreline data on first use)."""
+function write_gmt_script(outdir::String, label::String, title::String,
+                          latg::Matrix{Float64}, long::Matrix{Float64},
+                          disp::Matrix{Float64},
+                          mask::AbstractMatrix{Bool},
+                          dem::Matrix{Float64};
+                          vlat::Float64 = NaN, vlon::Float64 = NaN,
+                          vname::String = "",
+                          cbar::String = "LOS displacement [cm]")
+    H2, W2 = size(latg)
+    npts = 0
+    for k in eachindex(disp)
+        (mask[k] && !isnan(disp[k])) && (npts += 1)
+    end
+    npts < 50 &&
+        (println("  gmt: only ", npts, " coherent cells, no script"); return)
+    # ---- xyz exports (x=lon y=lat z=value, ASCII, for surface/nearneighbor)
+    open(joinpath(outdir, "disp_" * label * ".xyz"), "w") do io
+        for j in 1:H2, i in 1:W2
+            if mask[j, i] && !isnan(disp[j, i])
+                @printf(io, "%.6f %.6f %.3f\n",
+                        long[j, i], latg[j, i], disp[j, i])
+            end
+        end
+    end
+    open(joinpath(outdir, "dem_" * label * ".xyz"), "w") do io
+        for j in 1:H2, i in 1:W2
+            !isnan(dem[j, i]) && @printf(io, "%.6f %.6f %.1f\n",
+                        long[j, i], latg[j, i], dem[j, i])
+        end
+    end
+    # ---- region from the finite cells + 10 % context margin ----------
+    lo = Float64[]; la = Float64[]
+    for j in 1:H2, i in 1:W2
+        (!isnan(long[j, i])) && push!(lo, long[j, i])
+        (!isnan(latg[j, i])) && push!(la, latg[j, i])
+    end
+    (isempty(lo) || isempty(la)) &&
+        (println("  gmt: no geolocation, no script"); return)
+    lomin, lomax = extrema(lo); lamin, lamax = extrema(la)
+    padl = 0.10 * (lomax - lomin); padt = 0.10 * (lamax - lamin)
+    lomin -= padl; lomax += padl; lamin -= padt; lamax += padt
+    # ---- median cell spacing along the grid rows/columns -------------
+    dlon = Float64[]; dlat = Float64[]
+    jc = clamp(H2 ÷ 2, 1, H2); ic = clamp(W2 ÷ 2, 1, W2)
+    for i in 1:W2-1
+        a = long[jc, i]; b = long[jc, i + 1]
+        (!isnan(a) && !isnan(b) && b != a) && push!(dlon, abs(b - a))
+    end
+    for j in 1:H2-1
+        a = latg[j, ic]; b = latg[j + 1, ic]
+        (!isnan(a) && !isnan(b) && b != a) && push!(dlat, abs(b - a))
+    end
+    (isempty(dlon) || isempty(dlat)) &&
+        (println("  gmt: no cell spacing, no script"); return)
+    sort!(dlon); sort!(dlat)
+    cell_lon = dlon[div(length(dlon), 2) + 1]
+    cell_lat = dlat[div(length(dlat), 2) + 1]
+    incx = cell_lon / 2                      # ~2x oversample for surface
+    incy = cell_lat / 2
+    # ---- colour range: even integer, same rule as the BMP map --------
+    v99 = [abs(disp[k]) for k in eachindex(disp) if mask[k] && !isnan(disp[k])]
+    zs = max(2, 2 * ceil(Int, maximum(v99) / 2))
+    cbs = zs <= 4 ? 1 : (zs <= 8 ? 2 : (zs <= 20 ? 5 : 10))
+    # ---- coastline resolution by region span ---------------------------
+    span = max(lomax - lomin, lamax - lamin)
+    dres = span < 1.0 ? "f" : (span < 5.0 ? "h" : "i")
+    supp = 6 * cell_lat                       # coherent-support radius
+    vent = !isnan(vlat) && !isnan(vlon) &&
+           lamin <= vlat <= lamax && lomin <= vlon <= lomax
+    bash_clean(s) = replace(s, "\"" => "", "\$" => "", "`" => "")
+    path = joinpath(outdir, "gmt_map_" * label * ".sh")
+    open(path, "w") do io
+        println(io, "#!/bin/bash")
+        println(io, "# Auto-generated by insar_sat.jl for this dataset -- all")
+        println(io, "# region/spacing/colour parameters were derived from the")
+        println(io, "# data; no manual editing needed. Requires GMT 6 (classic)")
+        println(io, "# + ghostscript. Writes gmt_map_", label, ".png")
+        println(io, "set -e")
+        println(io, "cd \"\$(dirname \"\$0\")\"")
+        @printf(io, "R=\"-R%.4f/%.4f/%.4f/%.4f\"\n", lomin, lomax, lamin, lamax)
+        @printf(io, "I=\"-I%.5g/%.5g\"\n", incx, incy)
+        println(io, "J=\"-JM14c\"")
+        println(io, "# interpolate DEM + displacement (minimum-curvature splines)")
+        println(io, "gmt surface dem_", label, ".xyz \$R \$I -Gdem_", label,
+                ".nc -T0.35 -C0.01")
+        println(io, "gmt surface disp_", label, ".xyz \$R \$I -Gdisp_", label,
+                ".nc -T0.35 -C0.01")
+        println(io, "# background: smoothed DEM + hillshade, ocean/land cpt")
+        println(io, "gmt grdfilter dem_", label, ".nc -Dp -Fg5 -Gdems_",
+                label, ".nc")
+        println(io, "gmt grdgradient dems_", label, ".nc -Ne0.6 -A315 -Gshade_",
+                label, ".nc")
+        println(io, "printf '0   208 224 238   0.1 208 224 238\\n",
+                "0.1 232 232 228   380  250 248 244\\n' > bg.cpt")
+        @printf(io, "# displacement: smoothed, masked to the coherent support\n")
+        @printf(io, "gmt makecpt -Cjet -T%d/%d/1 -Z > disp.cpt\n", -zs, zs)
+        println(io, "gmt grdfilter disp_", label, ".nc -Dp -Fg9 -Gdispf_",
+                label, ".nc")
+        @printf(io, "gmt nearneighbor disp_%s.xyz \$R \$I -S%.5g -Gnear_%s.nc\n",
+                label, supp, label)
+        println(io, "gmt grdmath near_", label, ".nc ISNAN 1 SUB -1 MUL 0 NAN",
+                " = mask_", label, ".nc")
+        println(io, "gmt grdmath dispf_", label, ".nc mask_", label,
+                ".nc MUL = dispm_", label, ".nc")
+        println(io, "gmt grdfill dispm_", label, ".nc -An10 -Gdispmf_",
+                label, ".nc")
+        println(io, "# compose: hillshade -> ocean -> fringes -> coastline")
+        println(io, "gmt grdimage dems_", label, ".nc -Cbg.cpt -Ishade_",
+                label, ".nc \$R \$J -K -P > gmt_map_", label, ".ps")
+        println(io, "gmt pscoast \$R \$J -S208,224,238 -D", dres,
+                " -K -O >> gmt_map_", label, ".ps")
+        println(io, "gmt grdimage dispmf_", label, ".nc -Cdisp.cpt \$R \$J",
+                " -Q -K -O >> gmt_map_", label, ".ps")
+        println(io, "gmt pscoast \$R \$J -W0.75p -D", dres, " -K -O >> gmt_map_",
+                label, ".ps")
+        if vent
+            @printf(io, "echo \"%.5f %.5f\" | gmt psxy \$R \$J -Sa0.45c -Gblack",
+                    vlon, vlat)
+            println(io, " -W0.5p,white -K -O >> gmt_map_", label, ".ps")
+            @printf(io, "echo \"%.5f %.5f 9 0 0 LM %s\" | gmt pstext \$R \$J",
+                    vlon, vlat + 0.4 * cell_lat, bash_clean(vname))
+            println(io, " -K -O >> gmt_map_", label, ".ps")
+        end
+        println(io, "gmt psscale \$R \$J -Cdisp.cpt -DjCB+w12c+h+o0/0.8c",
+                " -Bx", cbs, "+l\"", cbar, "\" -K -O >> gmt_map_", label, ".ps")
+        println(io, "gmt psbasemap \$R \$J -Baf -B+t\"", bash_clean(title),
+                "\" -O >> gmt_map_", label, ".ps")
+        println(io, "gmt psconvert gmt_map_", label, ".ps -Tg -A -Z")
+        println(io, "echo \"wrote gmt_map_", label, ".png\"")
+    end
+    @printf("  wrote gmt_map_%s.sh + disp/dem xyz (%d pts, cmap +-%d cm)%s\n",
+            label, npts, zs, vent ? " + vent" : "")
 end
 
 """Second-stage multilook: mean of a real field over azf x rgf blocks
