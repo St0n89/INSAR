@@ -4368,11 +4368,13 @@ function raw_split(opts::Dict{String,String}, outdir::String)
     write_los_map(joinpath(outdir, "map_split_vertical.bmp"),
                   latd, lond, up, m2, demd;
                   title = "VERTICAL deformation (cm), dN=0 split",
+                  cbar = "Vertical displacement [cm]",
                   vlat = vlat, vlon = vlon, vname = vname,
                   bg = mbg, s2year = myr, s2zoom = mzo)
     write_los_map(joinpath(outdir, "map_split_east.bmp"),
                   latd, lond, ea, m2, demd;
                   title = "EAST deformation (cm), dN=0 split",
+                  cbar = "East displacement [cm]",
                   vlat = vlat, vlon = vlon, vname = vname,
                   bg = mbg, s2year = myr, s2zoom = mzo)
     for (nm, fld) in (("vertical", up), ("east", ea))
@@ -5586,6 +5588,7 @@ function write_los_map(path::String, latg::Matrix{Float64}, long::Matrix{Float64
                        disp::Matrix{Float64}, mask::AbstractMatrix{Bool},
                        dem::Matrix{Float64};
                        title::String = "LOS deformation",
+                       cbar::String = "LOS displacement [cm]",
                        vlat::Float64 = NaN, vlon::Float64 = NaN,
                        vname::String = "Geldingadalur",
                        bg::String = "hill", s2year::Int = 2020,
@@ -5844,7 +5847,7 @@ function write_los_map(path::String, latg::Matrix{Float64}, long::Matrix{Float64
         lab = @sprintf("%d", round(Int, v))
         map_draw_text!(img, px - div(map_text_w(lab, 1), 2), by + bh + 6, lab, scale = 1)
     end
-    cap = "LOS displacement [cm]"
+    cap = cbar
     map_draw_text!(img, bx + div(bw - map_text_w(cap, 1), 2), by + bh + 22, cap, scale = 1)
 
     # ---- title + vent marker ---------------------------------------------
