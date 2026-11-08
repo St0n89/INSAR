@@ -3612,36 +3612,56 @@ function json_pairs(s::AbstractString)::Vector{Tuple{Float64,Float64}}
     return out
 end
 
-"""All SENTINEL1 IW SLC products of a UTC day window whose footprint contains
+"""All SENTINEL-1 IW SLC products of a UTC day window whose footprint contains
 (lat, lon). Returns (name, t_start, t_stop, orbit_dir) tuples, name without
-.SAFE; orbit_dir is "" when the catalogue omits the attribute."""
+.SAFE; orbit_dir is "" when the catalogue omits the attribute.
+
+The spatial test runs SERVER-SIDE via OData.CSC.Intersects on the point, so
+only the handful of swaths over the target come back instead of the whole
+constellation (~860 IW SLC/day: 818 on 2021-03-07 with S1A+S1B, 861 on
+2026-11-06 with S1C 416 + S1D 445). The old client-side-only filter paged
+through a single \$top=1000 page and silently dropped scenes once a day
+exceeded 1000 products. A \$skip loop pages up to the CDSE deep-pagination
+limit (\$skip <= 10000, in force since 12 Nov 2024) as belt and braces, and
+the client-side point-in-polygon stays as a second check because the
+catalogue footprints are simplified quads."""
 function odata_find_day(t0::String, t1::String, lat::Float64, lon::Float64)
+    geo = "OData.CSC.Intersects(area=geography%27SRID=4326;POINT(" *
+          replace(@sprintf("%.6f %.6f", lon, lat), " " => "%20") * ")%27)"
     q = "https://catalogue.dataspace.copernicus.eu/odata/v1/Products" *
-        "?\$top=1000&\$filter=Collection/Name%20eq%20%27SENTINEL-1%27" *
+        "?\$top=1000&\$filter=" * geo *
+        "%20and%20Collection/Name%20eq%20%27SENTINEL-1%27" *
         "%20and%20contains(Name,%27_IW_SLC__1SDV%27)" *
         "%20and%20ContentDate/Start%20ge%20" * t0 *
         "%20and%20ContentDate/Start%20le%20" * t1 *
         "&\$expand=Attributes"
-    rc, code, _, body = http_get(q; timeout_s = 90)
-    (rc != 0 || code != 200) && error("OData query failed (rc=$rc code=$code)")
-    txt = String(body)
     out = Tuple{String,Float64,Float64,String}[]
-    idxs = [m.offset for m in eachmatch(r"\"Name\":\"(S1[AB]_IW_SLC[^\"]+)\"", txt)]
-    for k in eachindex(idxs)
-        o = idxs[k]
-        nm = match(r"\"Name\":\"(S1[AB]_IW_SLC[^\"]+)\"", txt[o:end])[1]
-        endo = k < length(idxs) ? idxs[k + 1] : lastindex(txt)
-        seg = txt[o:endo-1]
-        cm = match(r"\"ContentDate\":\{\"Start\":\"([^\"]+)\",\"End\":\"([^\"]+)\"", seg)
-        cm === nothing && continue
-        arr = json_coord_array(seg)
-        arr === nothing && continue
-        coords = json_pairs(arr)
-        (length(coords) >= 3 && point_in_poly(coords, lon, lat)) || continue
-        odm = match(r"\"Name\":\"orbitDirection\",\"Value\":\"(ASCENDING|DESCENDING)\"", seg)
-        od = odm === nothing ? "" : String(odm[1])
-        endswith(nm, ".SAFE") && (nm = nm[1:end-5])
-        push!(out, (String(nm), parse_s1_time(cm[1]), parse_s1_time(cm[2]), od))
+    seen = Set{String}()
+    for skip in 0:1000:10000          # CDSE caps \$skip at 10000
+        qs = skip == 0 ? q : q * "&\$skip=" * string(skip)
+        rc, code, _, body = http_get(qs; timeout_s = 90)
+        (rc != 0 || code != 200) && error("OData query failed (rc=$rc code=$code)")
+        txt = String(body)
+        idxs = [m.offset for m in eachmatch(r"\"Name\":\"(S1[A-Z]_IW_SLC[^\"]+)\"", txt)]
+        for k in eachindex(idxs)
+            o = idxs[k]
+            nm = match(r"\"Name\":\"(S1[A-Z]_IW_SLC[^\"]+)\"", txt[o:end])[1]
+            endo = k < length(idxs) ? idxs[k + 1] : lastindex(txt)
+            seg = txt[o:endo-1]
+            (nm in seen) && continue
+            push!(seen, nm)
+            cm = match(r"\"ContentDate\":\{\"Start\":\"([^\"]+)\",\"End\":\"([^\"]+)\"", seg)
+            cm === nothing && continue
+            arr = json_coord_array(seg)
+            arr === nothing && continue
+            coords = json_pairs(arr)
+            (length(coords) >= 3 && point_in_poly(coords, lon, lat)) || continue
+            odm = match(r"\"Name\":\"orbitDirection\",\"Value\":\"(ASCENDING|DESCENDING)\"", seg)
+            od = odm === nothing ? "" : String(odm[1])
+            endswith(nm, ".SAFE") && (nm = nm[1:end-5])
+            push!(out, (String(nm), parse_s1_time(cm[1]), parse_s1_time(cm[2]), od))
+        end
+        (length(idxs) < 1000 || skip >= 10000) && break
     end
     return out
 end
