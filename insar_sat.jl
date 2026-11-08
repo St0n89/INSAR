@@ -5925,6 +5925,12 @@ function write_gmt_script(outdir::String, label::String, title::String,
     cell_lat = dlat[div(length(dlat), 2) + 1]
     incx = cell_lon / 2                      # ~2x oversample for surface
     incy = cell_lat / 2
+    # SNAP: GMT demands (max-min) = N * inc exactly (|eps| <= 1e-4),
+    # so derive N from the half-cell size, then inc = span / N
+    nxg = max(50, round(Int, (lomax - lomin) / incx))
+    nyg = max(50, round(Int, (lamax - lamin) / incy))
+    incx = (lomax - lomin) / nxg
+    incy = (lamax - lamin) / nyg
     # ---- colour range: even integer, same rule as the BMP map --------
     v99 = [abs(disp[k]) for k in eachindex(disp) if mask[k] && !isnan(disp[k])]
     zs = max(2, 2 * ceil(Int, maximum(v99) / 2))
@@ -5937,8 +5943,8 @@ function write_gmt_script(outdir::String, label::String, title::String,
            lamin <= vlat <= lamax && lomin <= vlon <= lomax
     bash_clean(s) = replace(s, "\"" => "", "\$" => "", "`" => "")
     # ---- shared GMT command list (classic syntax, literal values) -----
-    rs = @sprintf("-R%.4f/%.4f/%.4f/%.4f", lomin, lomax, lamin, lamax)
-    is = @sprintf("-I%.5g/%.5g", incx, incy)
+    rs = @sprintf("-R%.6f/%.6f/%.6f/%.6f", lomin, lomax, lamin, lamax)
+    is = @sprintf("-I%.10g/%.10g", incx, incy)
     js = "-JM14c"
     cmds = String[
         "surface dem_" * label * ".xyz " * rs * " " * is *
@@ -5957,12 +5963,11 @@ function write_gmt_script(outdir::String, label::String, title::String,
             label * ".nc",
         "grdmath dispf_" * label * ".nc mask_" * label * ".nc MUL = dispm_" *
             label * ".nc",
-        "grdfill dispm_" * label * ".nc -An10 -Gdispmf_" * label * ".nc",
         "grdimage dems_" * label * ".nc -Cbg.cpt -Ishade_" * label * ".nc " *
             rs * " " * js * " -K -P > gmt_map_" * label * ".ps",
         "pscoast " * rs * " " * js * " -S208,224,238 -D" * dres *
             " -K -O >> gmt_map_" * label * ".ps",
-        "grdimage dispmf_" * label * ".nc -Cdisp.cpt " * rs * " " * js *
+        "grdimage dispm_" * label * ".nc -Cdisp.cpt " * rs * " " * js *
             " -Q -K -O >> gmt_map_" * label * ".ps",
         "pscoast " * rs * " " * js * " -W0.75p -D" * dres * " -K -O" *
             " >> gmt_map_" * label * ".ps",
