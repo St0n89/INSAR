@@ -2301,8 +2301,9 @@ function s1_pixel_of_geo_rd(ann::S1Annotation, lat::Float64, lon::Float64,
     if k < 0                             # pick first burst whose window fits
         kk = 0
         w = ann.lines_per_burst * ann.azimuth_dt
+        tol = 0.1   # s; edge targets sit a few ms outside a window
         for b in 1:length(ann.bursts)
-            if t >= ann.bursts[b].t_az && t < ann.bursts[b].t_az + w
+            if t >= ann.bursts[b].t_az - tol && t < ann.bursts[b].t_az + w + tol
                 kk = b - 1; break
             end
         end
@@ -2364,9 +2365,14 @@ TWO bursts at different steering Doppler. The interferometric partner is
 the appearance with the SAME Doppler phase as the primary sample, i.e. the
 burst whose (t_S - anchor) matches the primary's (t_P - anchor_P) within
 the window. S1A/S1B same-track burst anchors are synchronized to ~1 ms,
-which makes this pairing exact. Also returns dtp = per-GCP
-secondary-minus-primary zero-Doppler TIME offset (for the orbit evaluation
-in topo removal)."""
+which makes this pairing exact. Pass-to-pass along-track orbit shifts
+move a GCP's zero-Doppler time a few ms PAST a window edge, so burst
+containment needs a small tolerance: strict containment rejects the
+correct burst, and the neighbouring-burst candidate (u_s off by one
+burst cycle) then fails the 1 s Doppler test -> 0 GCPs (measured: desc
+Campi Flegrei 2024-02-05/17 iw1, delta = -1.6 ms, 0/63 GCPs). Also
+returns dtp = per-GCP secondary-minus-primary zero-Doppler TIME offset
+(for the orbit evaluation in topo removal)."""
 function coreg_shift_gcps(annP::S1Annotation, annS::S1Annotation, k::Int)
     dl = Float64[]; dp = Float64[]; dtp = Float64[]
     wS = annS.lines_per_burst * annS.azimuth_dt
@@ -2377,11 +2383,16 @@ function coreg_shift_gcps(annP::S1Annotation, annS::S1Annotation, k::Int)
               g.line - (g.line ÷ annP.lines_per_burst) * annP.lines_per_burst)
         uP_s = uP * annP.azimuth_dt          # seconds into the primary burst
         tS, rS = s1_rd_time(annS, g.lat, g.lon, g.hgt)
-        # pick the secondary burst appearance with matching Doppler phase
+        # pick the secondary burst appearance with matching Doppler phase;
+        # a small edge tolerance: orbit shifts put a GCP's zero-Doppler time
+        # a few ms past a window edge, and strict containment would reject
+        # the correct burst (the neighbour candidate then fails the Doppler
+        # test and the GCP is lost entirely)
         bestu = -1.0; lS = -1.0
+        tol = 0.1     # s
         for b in 1:length(annS.bursts)
             anchor = annS.bursts[b].t_az
-            (tS < anchor - 1e-9 || tS >= anchor + wS) && continue
+            (tS < anchor - tol || tS >= anchor + wS + tol) && continue
             u_s = tS - anchor
             if bestu < 0 || abs(u_s - uP_s) < bestu
                 bestu = abs(u_s - uP_s)
@@ -4068,9 +4079,10 @@ function s1_target_burst(ann::S1Annotation, lat::Float64, lon::Float64;
     LPB = ann.lines_per_burst
     wS = LPB * ann.azimuth_dt
     bestk = -1; bestd = Inf
+    tol = 0.1   # s; targets near a burst edge sit a few ms outside a window
     for k in 0:length(ann.bursts) - 1
         u = t_rd - ann.bursts[k + 1].t_az
-        (u < 0 || u >= wS) && continue
+        (u < -tol || u >= wS + tol) && continue
         d = abs(u - wS / 2)
         d < bestd && (bestd = d; bestk = k)
     end
