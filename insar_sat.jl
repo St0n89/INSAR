@@ -3971,9 +3971,12 @@ end
 """Download iw-vv (default iw2) measurement TIFF + annotation XML of an ASF
 S1 SLC product into datadir, reusing files already present (naming convention
 asf<disc>_<iw>_vv.tiff / <disc>_<iw>_vv.xml). Verifies CRC32 from the zip
-central directory and MD5 from manifest.safe. Returns (tiff, xml)."""
+central directory and MD5 from manifest.safe; the MD5 check is a hard error
+unless md5warn (a zip whose own manifest contradicts its measurement file
+can then pass, with the content judged downstream via RD solve + coherence).
+Returns (tiff, xml)."""
 function s1_pair_download(prodname::String, datadir::String, tok::String;
-                          iw::String = "iw2")
+                          iw::String = "iw2", md5warn::Bool = false)
     iw in ("iw1", "iw2", "iw3") || error("iw must be iw1|iw2|iw3")
     disc = split(prodname, "_")[end]
     tiff = joinpath(datadir, "asf" * disc * "_" * iw * "_vv.tiff")
@@ -4039,6 +4042,14 @@ function s1_pair_download(prodname::String, datadir::String, tok::String;
             if lowercase(md5) == md5got
                 md5ok = true
                 println("  ", disc, ": MD5 matches manifest.safe ✓")
+            elseif md5warn
+                md5ok = true
+                println("  ", disc, ": WARNING: MD5 mismatch vs manifest.safe, ",
+                        "continuing (--md5warn): ", md5got, " != ", md5)
+                println("  ", disc, ": transfer integrity is CRC32-verified; ",
+                        "this zip ships a manifest inconsistent with its own ",
+                        "measurement file -- judge the content via RD solve ",
+                        "+ coherence")
             else
                 error("MD5 mismatch vs manifest.safe: $md5got != $md5")
             end
@@ -4147,14 +4158,18 @@ end
 Options: --lat --lon --date --date2 [--dtol N] [--pass auto|desc|asc]
 [--p1 NAME] [--p2 NAME] [--topo] [--nlines N] [--npix N] [--coh C] [--datadir DIR]
 [--vname NAME] [--unwrap qg|wls] [--iw iw1|iw2|iw3]
-[--mapbg hill|sat] [--s2year Y] [--s2zoom Z]
+[--mapbg hill|sat] [--s2year Y] [--s2zoom Z] [--md5warn]
 (with --topo: native Vedurstofa-style LOS map BMP; --iw selects the subswath
 to download, default iw2. NOTE: pick the subswath that CONTAINS the target:
 s1_target_burst errors when the target is outside the azimuth window, but a
 target beyond the range edges can silently produce a block west of the vent.
 Fagradalsfjall: desc track = iw2, asc track = iw1. --mapbg sat overlays the
 fringes at 65% over the real Sentinel-2 cloudless mosaic (EOX tiles, default
-year 2020 = pre-eruption landscape) instead of the grey hillshade.)"""
+year 2020 = pre-eruption landscape) instead of the grey hillshade.
+--md5warn downgrades the manifest.safe MD5 check to a warning: some ASF
+zips ship a manifest inconsistent with their own measurement tiff, while
+CRC32 vs the zip central directory still hard-verifies the transfer;
+judge the content via the RD solve and pair coherence.)"""
 function raw_pair_driver(opts::Dict{String,String}, outdir::String)
     lat = num(opts, "lat", NaN)
     lon = num(opts, "lon", NaN)
@@ -4205,8 +4220,10 @@ function raw_pair_driver(opts::Dict{String,String}, outdir::String)
     s2t != 0.0 && @printf("pair dt   : %.3f d\n", (s2t - p1t) / 86400)
     println("download: ASF range-ZIP (Earthdata bearer), ",
             get(opts, "iw", "iw2"), "-vv...")
-    tiff1, xml1 = s1_pair_download(p1name, datadir, tok; iw = get(opts, "iw", "iw2"))
-    tiff2, xml2 = s1_pair_download(s2name, datadir, tok; iw = get(opts, "iw", "iw2"))
+    tiff1, xml1 = s1_pair_download(p1name, datadir, tok; iw = get(opts, "iw", "iw2"),
+                                   md5warn = haskey(opts, "md5warn"))
+    tiff2, xml2 = s1_pair_download(s2name, datadir, tok; iw = get(opts, "iw", "iw2"),
+                                   md5warn = haskey(opts, "md5warn"))
     A1 = parse_s1_annotation(xml1)
     A2 = parse_s1_annotation(xml2)
     if passwant in ("desc", "asc")
