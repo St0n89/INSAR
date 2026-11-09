@@ -3782,7 +3782,12 @@ struct ZipMember
 end
 
 """Read the ZIP end-of-central-directory over HTTP ranges and parse the
-central directory. Returns the member list."""
+central directory. Returns the member list. Handles zip64 archives (S1
+products >= 2024 are ~8 GB: the CD offset no longer fits the classic
+32-bit EOCD fields and member local-header offsets exceed 4 GiB): the
+real values live in the zip64 EOCD record (PK\\x06\\x06) just before the
+classic EOCD, and per member in the 0x0001 zip64 extra field; the
+classic fields are 0xFFFF/0xFFFFFFFF sentinels then."""
 function zip_central_dir(loc::String, zsize::Int)::Vector{ZipMember}
     t0 = max(0, zsize - 65536)
     rc, code, _, tail = http_get(loc; rng = string(t0) * "-" * string(zsize - 1),
@@ -3799,6 +3804,21 @@ function zip_central_dir(loc::String, zsize::Int)::Vector{ZipMember}
     nmem = Int(reinterpret(UInt16, tail[eocd+10:eocd+11])[1])
     cdsize = Int(reinterpret(UInt32, tail[eocd+12:eocd+15])[1])
     cdoff = Int(reinterpret(UInt32, tail[eocd+16:eocd+19])[1])
+    # zip64: saturated classic fields -> real values in the zip64 EOCD
+    # record, which sits just before the locator just before the EOCD
+    if nmem == 0xFFFF || cdsize == 0xFFFFFFFF || cdoff == 0xFFFFFFFF
+        z64 = 0
+        for i in eocd - 1:-1:1
+            if tail[i] == 0x50 && tail[i+1] == 0x4b && tail[i+2] == 0x06 && tail[i+3] == 0x06
+                z64 = i
+                break
+            end
+        end
+        z64 == 0 && error("zip64 EOCD record not found in zip tail")
+        nmem == 0xFFFF && (nmem = Int(reinterpret(UInt64, tail[z64+32:z64+39])[1]))
+        cdsize == 0xFFFFFFFF && (cdsize = Int(reinterpret(UInt64, tail[z64+40:z64+47])[1]))
+        cdoff == 0xFFFFFFFF && (cdoff = Int(reinterpret(UInt64, tail[z64+48:z64+55])[1]))
+    end
     (nmem == 0 || cdsize == 0) && error("EOCD parse garbage (nmem=$nmem)")
     if cdoff >= t0
         cd = tail[cdoff - t0 + 1:cdoff - t0 + cdsize]
@@ -3821,9 +3841,26 @@ function zip_central_dir(loc::String, zsize::Int)::Vector{ZipMember}
         clen = Int(reinterpret(UInt16, cd[p+32:p+33])[1])
         lho = Int(reinterpret(UInt32, cd[p+42:p+45])[1])
         nm = String(cd[p+46:p+45+nlen])
+        # zip64 extra field (0x0001): 8-byte values replace saturated
+        # fields, in the fixed order usize, csize, local-header offset
+        qend = p + 45 + nlen + elen
+        q = p + 46 + nlen
+        while q + 3 <= qend
+            hid = Int(reinterpret(UInt16, cd[q:q+1])[1])
+            hsz = Int(reinterpret(UInt16, cd[q+2:q+3])[1])
+            if hid == 0x0001
+                r = q + 4
+                usz == 0xFFFFFFFF && (usz = Int(reinterpret(UInt64, cd[r:r+7])[1]); r += 8)
+                csz == 0xFFFFFFFF && (csz = Int(reinterpret(UInt64, cd[r:r+7])[1]); r += 8)
+                lho == 0xFFFFFFFF && (lho = Int(reinterpret(UInt64, cd[r:r+7])[1]); r += 8)
+            end
+            q += 4 + hsz
+        end
         push!(members, ZipMember(nm, meth, crc, csz, usz, lho))
         p += 46 + nlen + elen + clen
     end
+    isempty(members) &&
+        error("zip central directory parse failed (0 of $nmem; zip64 layout?)")
     length(members) == nmem ||
         println("  zip: parsed ", length(members), " of ", nmem, " members (odd)")
     return members
