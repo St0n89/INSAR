@@ -4330,6 +4330,52 @@ function split_read_grid(path::String)
     return H2, W2, ux, uy, uz, hdg, lon, lat, disp, dem
 end
 
+"""NaN-aware stack (mean) of same-geometry grid sidecars onto the FIRST
+grid's cell frame. Later grids are affine-fitted and bilinearly resampled
+onto the first grid's (lon, lat) centres (the same machinery raw split uses
+for desc/asc grids), so slightly shifted blocks stack correctly. Cells
+NaN in every input stay NaN. LOS vector/heading/DEM come from the first
+grid; all inputs must share its geometry (guarded). Returns the averaged
+grid plus a per-cell coverage count."""
+function stack_grids(files::Vector{String})
+    isempty(files) && error("stack: no grid files")
+    Hd, Wd, ux, uy, uz, hdg, lon, lat, disp0, dem = split_read_grid(files[1])
+    acc = zeros(Hd, Wd); cnt = zeros(Int, Hd, Wd)
+    for (fi, f) in enumerate(files)
+        H, W, ux2, uy2, uz2, hdg2, lo2, la2, di2, de2 = split_read_grid(f)
+        maximum(abs.((ux2 - ux, uy2 - uy, uz2 - uz))) < 0.01 ||
+            error("stack: LOS vector of ", f, " differs from ", files[1])
+        abs(hdg2 - hdg) < 1.0 ||
+            error("stack: heading ", hdg2, " of ", f, " differs from ", hdg)
+        if fi == 1
+            for k in eachindex(di2)
+                if !isnan(di2[k]); acc[k] += di2[k]; cnt[k] += 1; end
+            end
+        else
+            af = split_geo_affine(la2, lo2)
+            for j in 1:Hd, i in 1:Wd
+                jf, iF = split_geo_inv(af, lon[j, i], lat[j, i])
+                isnan(jf) && continue
+                # sub-ulp edge fuzz: cells exactly on the rim of the other
+                # grid map to 0.999.. / H+1e-9 and would be dropped as outside
+                0.99 <= jf < 1.0 && (jf = 1.001)
+                0.99 <= iF < 1.0 && (iF = 1.001)
+                H < jf <= H + 0.01 && (jf = H - 0.001)
+                W < iF <= W + 0.01 && (iF = W - 0.001)
+                v = split_bil(di2, jf, iF)
+                isnan(v) && continue
+                acc[j, i] += v; cnt[j, i] += 1
+            end
+        end
+    end
+    any(>(0), cnt) || error("stack: every cell is NaN (no overlap?)")
+    disp = similar(acc)
+    for k in eachindex(acc)
+        disp[k] = cnt[k] > 0 ? acc[k] / cnt[k] : NaN
+    end
+    return Hd, Wd, ux, uy, uz, hdg, lon, lat, disp, dem, cnt
+end
+
 """Least-squares affine fit  lat = a + b*j + c*i, lon = d + e*j + f*i."""
 function split_geo_affine(latg::Matrix{Float64}, long::Matrix{Float64})
     H2, W2 = size(latg)
@@ -4479,6 +4525,58 @@ function raw_split(opts::Dict{String,String}, outdir::String)
                          vlat = vlat, vlon = vlon, vname = vname,
                          cbar = uppercasefirst(nm) * " displacement [cm]")
     end
+end
+
+"""raw stack --desc DIR --asc DIR: average every same-heading grid_*.txt
+sidecar found in each dir (or the explicit comma list in --descgrid /
+--ascgrid), write stacked sidecars, then run the asc/desc split on the
+stacked fields. Consecutive pairs share scenes, so a stack of n pairs
+needs n+1 scene downloads per pass. Atmospheric errors decorrelate
+between pairs while a steady deformation signal adds, so the stack
+noise falls roughly as 1/sqrt(n) while the signal stays at its 12-day
+level (for equally spaced consecutive pairs)."""
+function raw_stack(opts::Dict{String,String}, outdir::String)
+    descd = get(opts, "desc", ""); ascd = get(opts, "asc", "")
+    (isempty(descd) || isempty(ascd)) &&
+        error("raw stack needs --desc DIR --asc DIR (same as raw split)")
+    stack_side = (dir, ovr, want) -> begin
+        files = String[]
+        if !isempty(ovr)
+            files = [strip(x) for x in split(ovr, ",") if !isempty(strip(x))]
+        else
+            cands = sort(filter(f -> startswith(f, "grid_") && endswith(f, ".txt"),
+                                readdir(dir)))
+            for c in cands
+                hd = grid_heading(joinpath(dir, c))
+                ok = want == "desc" ? (150 <= hd <= 240) : (hd >= 320 || hd <= 40)
+                ok && push!(files, joinpath(dir, c))
+            end
+            isempty(files) && error("no ", want, "-heading grid_*.txt in ", dir,
+                " (candidates: ", isempty(cands) ? "none" : join(cands, ", "), ")")
+        end
+        H, W, ux, uy, uz, hdg, lon, lat, disp, dem, cnt =
+            stack_grids(files)
+        covered = findall(>(0), cnt)
+        @printf("  %s stack: %d grid(s)%s -> %dx%d cells, %.0f-%d input(s)/cell, %d valid\n",
+            want, length(files), length(files) == 1 ? "" : " (averaged)",
+            H, W, minimum(cnt[covered]), maximum(cnt), count(!isnan, disp))
+        out = joinpath(outdir, "stack_" * want * ".txt")
+        open(out, "w") do io
+            @printf(io, "# %d %d %.6f %.6f %.6f %.2f\n", H, W, ux, uy, uz, hdg)
+            for j in 1:H, i in 1:W
+                @printf(io, "%.6f %.6f %.3f %.1f\n",
+                        lon[j, i], lat[j, i], disp[j, i], dem[j, i])
+            end
+        end
+        @printf("  wrote %s\n", out)
+        return out
+    end
+    sd = stack_side(descd, get(opts, "descgrid", ""), "desc")
+    sa = stack_side(ascd, get(opts, "ascgrid", ""), "asc")
+    opts2 = copy(opts)
+    opts2["descgrid"] = sd
+    opts2["ascgrid"] = sa
+    raw_split(opts2, outdir)
 end
 
 # ----------------------------------------------------------------------------
@@ -6227,6 +6325,14 @@ function usage()
                                       grid_*.txt sidecars of two --topo runs,
                                       solves up+east per cell assuming dN=0,
                                       writes split_vertical/east xyz + 2 maps)
+                        raw stack   --desc DIR --asc DIR [same options as split]
+                                      (NaN-aware mean of EVERY desc-heading
+                                      grid_*.txt in --desc and every asc one in
+                                      --asc, then the split on the stacked
+                                      fields; --descgrid/--ascgrid may give
+                                      explicit comma-separated file lists.
+                                      n stacked pairs need n+1 scenes/pass:
+                                      atmosphere ~ 1/sqrt(n), signal adds)
                         raw dem     --ann XML --tiff TIFF [--burst N]
                                       [--l0 L] [--l1 L] [--p0 P] [--p1 P]
                                       [--mla A] [--mlr R] [--stride S]
@@ -6448,6 +6554,10 @@ function main()
             raw_split(opts, outdir)
             println("done.")
             return
+        elseif sub == "stack"
+            raw_stack(opts, outdir)
+            println("done.")
+            return
         end
         annpath = get(opts, "ann", "")
         isempty(annpath) && error("raw needs --ann <S1 annotation xml>")
@@ -6507,7 +6617,7 @@ function main()
                 stride = Int(num(opts, "stride", 4.0)),
                 outdir = outdir)
         else
-            println("raw: unknown subcommand '", sub, "' (info | selftest | ifg | pair | split | dem)")
+            println("raw: unknown subcommand '", sub, "' (info | selftest | ifg | pair | split | stack | dem)")
         end
         println("done.")
         return
