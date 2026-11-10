@@ -312,7 +312,7 @@ end
 
 # one API call with polite 429 handling (the anonymous elevation endpoint is
 # minutely rate-limited; on 429 we pause a full minute and continue)
-function fetch_chunk(url::String, outdir::String; attempts::Int = 6)
+function fetch_chunk(url::String, outdir::String; attempts::Int = 8)
     tmp = joinpath(outdir, ".tmp_elev")
     last_err = ""
     for attempt in 1:attempts
@@ -322,9 +322,15 @@ function fetch_chunk(url::String, outdir::String; attempts::Int = 6)
             s = read(tmp, String)
         catch err
             last_err = sprint(showerror, err)
-            println("    download hiccup (attempt ", attempt, "/", attempts,
-                    "), backing off...")
-            sleep(attempt == 1 ? 10.0 : 40.0)
+            if occursin("429", last_err)
+                println("    HTTP 429 rate-limited, pausing 65 s (attempt ",
+                        attempt, "/", attempts, ")...")
+                sleep(65.0)
+            else
+                println("    download hiccup (attempt ", attempt, "/", attempts,
+                        "), backing off...")
+                sleep(attempt == 1 ? 10.0 : 40.0)
+            end
             continue
         end
         part_rm!(tmp)
