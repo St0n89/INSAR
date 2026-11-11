@@ -323,9 +323,10 @@ function fetch_chunk(url::String, outdir::String; attempts::Int = 8)
         catch err
             last_err = sprint(showerror, err)
             if occursin("429", last_err)
-                println("    HTTP 429 rate-limited, pausing 65 s (attempt ",
-                        attempt, "/", attempts, ")...")
-                sleep(65.0)
+                w = min(65.0 * attempt, 300.0)
+                @printf("    HTTP 429 rate-limited, pausing %.0f s (attempt %d/%d)...\n",
+                        w, attempt, attempts)
+                sleep(w)
             else
                 println("    download hiccup (attempt ", attempt, "/", attempts,
                         "), backing off...")
@@ -2908,10 +2909,164 @@ function bil_grid(M::Matrix{Float64}, x::Float64, y::Float64)
            (1 - u) * v * M[i, j + 1] + u * v * M[i + 1, j + 1]
 end
 
+# ---- DEM footprint reuse ----------------------------------------------------
+# The block-DEM cache is keyed on block indices (l0/p0), which shift by a few
+# pixels between dates on the same track, so consecutive pairs used to
+# re-fetch the SAME terrain (~30 API calls each). dem_reuse! instead samples
+# any existing block cache whose footprint covers the new points (inverse
+# bilinear interpolation): repeated same-track pairs become fully offline
+# and immune to the Open-Meteo per-IP rate limits (10k/day, 600/min).
+
+"""Load a block-DEM cache file (`# l0 p0 mla mlr stride` header, then
+`lat lon hgt` per point, row-major a x b). Returns (lat, lon, hgt, W) with
+W = points per row, or nothing. W is inferred from the lon series: within
+a row lon steps by a constant column delta, at a row break it jumps back."""
+function dem_cache_load(path::String)
+    isfile(path) || return nothing
+    lines = try readlines(path) catch; return nothing end
+    isempty(lines) && return nothing
+    startswith(lines[1], "#") || return nothing
+    length(split(strip(lines[1][2:end]))) == 5 || return nothing
+    la = Float64[]; lo = Float64[]; ha = Float64[]
+    for i in 2:length(lines)
+        f = split(lines[i])
+        length(f) >= 3 || continue
+        try
+            (lowercase(f[1]) == "nan" || lowercase(f[3]) == "nan") && continue
+            push!(la, parse(Float64, f[1]))
+            push!(lo, parse(Float64, f[2]))
+            push!(ha, parse(Float64, f[3]))
+        catch
+            return nothing                  # corrupt line -> untrustworthy
+        end
+    end
+    n = length(la)
+    n >= 8 || return nothing
+    W = 0
+    step = abs(lo[2] - lo[1])               # lon column step within a row
+    step > 0 || return nothing
+    for k in 1:min(n - 1, 4000)
+        if abs(lo[k + 1] - lo[k]) > 2step   # lon jumped back -> row break
+            W = k
+            break
+        end
+    end
+    W > 0 || (W = n)                        # single row
+    return (la, lo, ha, W)
+end
+
+"""Inverse bilinear: find fractional (a, b) in the cached grid whose
+interpolated (lat, lon) matches the target. Newton refinement on the
+cell-wise bilinear surface, seeded by the affine init. Returns (a, b) or
+nothing (divergence / missing corner points)."""
+function dem_ab_of_geo(LAT::Matrix{Float64}, LON::Matrix{Float64},
+                       Hc::Int, W::Int, lat::Float64, lon::Float64,
+                       a0::Float64, b0::Float64)
+    a, b = a0, b0
+    for _ in 1:6
+        i = clamp(Int(floor(a)), 1, Hc - 1)
+        j = clamp(Int(floor(b)), 1, W - 1)
+        c11 = LAT[i, j];     c12 = LAT[i, j + 1]
+        c21 = LAT[i + 1, j]; c22 = LAT[i + 1, j + 1]
+        d11 = LON[i, j];     d12 = LON[i, j + 1]
+        d21 = LON[i + 1, j]; d22 = LON[i + 1, j + 1]
+        (isfinite(c11) && isfinite(c12) && isfinite(c21) && isfinite(c22) &&
+         isfinite(d11) && isfinite(d12) && isfinite(d21) && isfinite(d22)) ||
+            return nothing
+        u = a - i; v = b - j     # unclamped: linear edge extension, so the
+                                 # Newton residual stays smooth for targets
+                                 # slightly outside the cached footprint
+        fa = (1 - u) * (1 - v) * c11 + u * (1 - v) * c21 +
+             (1 - u) * v * c12 + u * v * c22
+        fb = (1 - u) * (1 - v) * d11 + u * (1 - v) * d21 +
+             (1 - u) * v * d12 + u * v * d22
+        da_a = (1 - v) * (c21 - c11) + v * (c22 - c12)
+        da_b = (1 - u) * (c12 - c11) + u * (c22 - c21)
+        db_a = (1 - v) * (d21 - d11) + v * (d22 - d12)
+        db_b = (1 - u) * (d12 - d11) + u * (d22 - d21)
+        det = da_a * db_b - da_b * db_a
+        abs(det) < 1e-25 && return nothing
+        ra = lat - fa; rb = lon - fb
+        aa = a + (db_b * ra - da_b * rb) / det
+        bb = b + (da_a * rb - db_a * ra) / det
+        (!isfinite(aa) || !isfinite(bb) ||
+         abs(aa - a) > 4.0 || abs(bb - b) > 4.0) && return nothing
+        dm = max(abs(aa - a), abs(bb - b))
+        a = aa; b = bb
+        dm < 1e-9 && break
+    end
+    return (a, b)
+end
+
+"""Try to fill DEMs (Hs x Ws, row-major over the n target points la/lo)
+from any existing block-DEM cache in cachedir whose footprint covers ALL
+targets (rim tolerance 0.25 cached cells, edge-clamped beyond). Returns
+true on success."""
+function dem_reuse!(DEMs::Matrix{Float64}, la::Vector{Float64},
+                    lo::Vector{Float64}, n::Int, cachedir::String,
+                    skip::String)
+    Hs, Ws = size(DEMs)
+    (n > 0 && isdir(cachedir)) || return false
+    files = try readdir(cachedir) catch; return false end
+    for f in sort(files)
+        (startswith(f, "dem_") && occursin("_rd_s", f) &&
+         endswith(f, ".txt") && f != skip) || continue
+        cand = dem_cache_load(joinpath(cachedir, f))
+        cand === nothing && continue
+        cla, clo, cha, W = cand
+        nc = length(cla)
+        Hc = cld(nc, W)
+        (W >= 2 && Hc >= 2) || continue
+        (W + 1 <= nc) || continue           # need (2,1) for the affine init
+        LAT = fill(NaN, Hc, W); LON = fill(NaN, Hc, W); HGT = fill(NaN, Hc, W)
+        for k in 1:nc
+            i = (k - 1) ÷ W + 1; j = (k - 1) % W + 1
+            LAT[i, j] = cla[k]; LON[i, j] = clo[k]; HGT[i, j] = cha[k]
+        end
+        # affine init (a, b) -> (lat, lon) from the first three basis points:
+        # (1,1), (1,2) [one column] and (2,1) [one row] are exact by basis
+        c2lat = cla[W + 1] - cla[1]; c3lat = cla[2] - cla[1]
+        c2lon = clo[W + 1] - clo[1]; c3lon = clo[2] - clo[1]
+        det = c2lat * c3lon - c3lat * c2lon
+        abs(det) < 1e-25 && continue
+        tol = 0.25                          # cached-cell rim tolerance
+        all_ok = true
+        vals = Vector{Float64}(undef, n)
+        for t in 1:n
+            dlat = la[t] - cla[1]; dlon = lo[t] - clo[1]
+            a0 = 1.0 + (c3lon * dlat - c3lat * dlon) / det
+            b0 = 1.0 + (c2lat * dlon - c2lon * dlat) / det
+            r = dem_ab_of_geo(LAT, LON, Hc, W, la[t], lo[t], a0, b0)
+            if r === nothing
+                all_ok = false; break
+            end
+            a, b = r
+            (a >= 1 - tol && a <= Hc + tol &&
+             b >= 1 - tol && b <= W + tol) || (all_ok = false; break)
+            h = bil_grid(HGT, clamp(a, 1.0, Float64(Hc)),
+                               clamp(b, 1.0, Float64(W)))
+            isfinite(h) || (all_ok = false; break)
+            vals[t] = h
+        end
+        if all_ok
+            for t in 1:n
+                i = (t - 1) ÷ Ws + 1; j = (t - 1) % Ws + 1
+                DEMs[i, j] = vals[t]
+            end
+            println("  DEM: reusing cached footprint ", f,
+                    " (", nc, " pts, 0 API calls)")
+            return true
+        end
+    end
+    return false
+end
+
 """Geolocate the multilook grid, fetch the REAL DEM on a strided subsample
 of it (Open-Meteo / Copernicus GLO-90, batched 100 pts/request, cache in
-outdir that is RESUMABLE across interrupted runs), and bilinear-fill it
-onto the full ML grid. Returns (lat, lon, hgt_ann, DEM), H x W matrices."""
+outdir that is RESUMABLE across interrupted runs; if an existing cache
+covers the block footprint the DEM is sampled from it instead, fully
+offline), and bilinear-fill it onto the full ML grid. Returns
+(lat, lon, hgt_ann, DEM), H x W matrices."""
 function dem_for_ml_block(ann::S1Annotation, l0::Int, p0::Int,
                           mla::Int, mlr::Int, H::Int, W::Int;
                           stride::Int = 4, outdir::String = "insar_out",
@@ -2968,36 +3123,50 @@ function dem_for_ml_block(ann::S1Annotation, l0::Int, p0::Int,
         @printf("  DEM: cache %d / %d pts (%s)\n", done, n, cache)
     end
     if done < n
-        @printf("  DEM: fetching %d pts from Open-Meteo (Copernicus GLO-90)\n",
-            n - done)
-        io = open(cache, done > 0 ? "a" : "w")
-        if done == 0
+        if dem_reuse!(DEMs, la, lo, n, cachedir, basename(cache))
+            # whole footprint covered by an existing same-ground cache:
+            # persist the sampled points under this block's key so the
+            # next run exact-matches and stays offline too
+            io = open(cache, "w")
             println(io, "# ", l0, " ", p0, " ", mla, " ", mlr, " ", stride)
-        end
-        k = done + 1
-        while k <= n
-            ke = min(k + 99, n)
-            url = "https://api.open-meteo.com/v1/elevation?latitude=" *
-                  join(string.(la[k:ke]), ",") * "&longitude=" *
-                  join(string.(lo[k:ke]), ",")
-            vals = fetch_chunk(url, outdir)
-            length(vals) == ke - k + 1 ||
-                error("API returned ", length(vals), " of ", ke - k + 1)
-            for i in k:ke
+            for i in 1:n
                 a, b = ab(i)
-                DEMs[a, b] = vals[i - k + 1]
-                @printf(io, "%.6f %.6f %.1f\n", la[i], lo[i], vals[i - k + 1])
+                @printf(io, "%.6f %.6f %.1f\n", la[i], lo[i], DEMs[a, b])
             end
-            flush(io)
-            k = ke + 1
-            if k <= n
-                @printf("  DEM fetch %3d %%\r", min(100, round(Int, 100ke / n)))
-                flush(stdout)
-                sleep(gap)
+            close(io)
+            println("  DEM fetch 100 %")
+        else
+            @printf("  DEM: fetching %d pts from Open-Meteo (Copernicus GLO-90)\n",
+                n - done)
+            io = open(cache, done > 0 ? "a" : "w")
+            if done == 0
+                println(io, "# ", l0, " ", p0, " ", mla, " ", mlr, " ", stride)
             end
+            k = done + 1
+            while k <= n
+                ke = min(k + 99, n)
+                url = "https://api.open-meteo.com/v1/elevation?latitude=" *
+                      join(string.(la[k:ke]), ",") * "&longitude=" *
+                      join(string.(lo[k:ke]), ",")
+                vals = fetch_chunk(url, outdir)
+                length(vals) == ke - k + 1 ||
+                    error("API returned ", length(vals), " of ", ke - k + 1)
+                for i in k:ke
+                    a, b = ab(i)
+                    DEMs[a, b] = vals[i - k + 1]
+                    @printf(io, "%.6f %.6f %.1f\n", la[i], lo[i], vals[i - k + 1])
+                end
+                flush(io)
+                k = ke + 1
+                if k <= n
+                    @printf("  DEM fetch %3d %%\r", min(100, round(Int, 100ke / n)))
+                    flush(stdout)
+                    sleep(gap)
+                end
+            end
+            close(io)
+            println("  DEM fetch 100 %")
         end
-        close(io)
-        println("  DEM fetch 100 %")
     end
     DEM = Matrix{Float64}(undef, H, W)
     for jj in 1:H, ii in 1:W
